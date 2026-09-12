@@ -1,0 +1,19 @@
+# CameraPath Lab — backend runtime deps (macOS / Apple Silicon, no CUDA)
+
+# --- web layer ---
+fastapi==0.121.2
+uvicorn[standard]==0.41.0
+pydantic==2.13.0
+python-multipart==0.0.20
+
+# --- numerics ---
+numpy>=2.1,<3
+scipy>=1.14,<2
+
+# --- computer vision ---
+# Pinned to OpenCV 4.x: 5.x is a major release with API removals we have not
+# validated against (SIFT/LK/RANSAC call sites in tracking/ and solvers/).
+opencv-contrib-python>=4.10,<5
+
+# --- classical 3D reconstruction (Phase 2) ---
+pycolmap>=3.11,<5

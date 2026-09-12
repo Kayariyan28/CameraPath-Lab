@@ -1,0 +1,5 @@
+# Optional, NOT installed by bootstrap. ~2.5 GB on disk.
+# Only needed for the VGGT learned-geometry backend (Phase 5).
+# Install with:  ./scripts/bootstrap_macos.sh --with-torch
+torch>=2.6
+torchvision>=0.21
