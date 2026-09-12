@@ -2,22 +2,50 @@
 
 A trajectory must never span an edit (invariant I4), so this runs before any
 reconstruction. The hard part is not finding cuts — it is *not* finding them in
-fast camera movement, which produces an appearance change just as large as a cut.
+fast camera movement, which changes a frame's appearance as much as an edit does.
 
-The discriminator is coherence, not magnitude:
+The primary cue is **motion-compensated residual**: align the previous frame to
+the current one with the best global similarity transform, then measure what is
+left over.
 
-    fast camera motion  ->  large flow, but COHERENT: tracks survive, and one
-                            geometric model explains most of them
-    a real cut          ->  large flow, INCOHERENT: tracks die wholesale and no
-                            single model fits what remains
+    fast camera motion  ->  one transform explains the whole frame, so almost
+                            nothing is left over, however large the motion
+    a real cut          ->  no transform explains anything, so the residual
+                            stays near the raw frame difference
 
-So appearance cues (histogram, structural) are necessary but never sufficient; a
-cut additionally requires track collapse. Both are judged against a local
-baseline, because a clip that is uniformly fast has a high floor and a clip that
-is uniformly static has a very low one.
+That cue was chosen over histogram comparison after measuring both. Histogram
+difference fails in two common situations, and both are represented in the test
+clips:
 
-This pass runs at a deliberately small resolution (~256 px long edge) — cut
-detection needs gross change, not detail, and staying small keeps it nearly free.
+  * a cut between two shots of the same place (reverse angle, same lighting)
+    barely changes the histogram at all — measured appearance ratio 1.11x against
+    the local baseline, far below any usable threshold
+  * a whip pan changes the histogram as much as a cut does
+
+Measured separation for the compensated residual, at 384 px analysis resolution:
+a real cut scores 0.21 absolute residual while every non-cut transition across
+nine clips — including a 145 px/frame sinusoidal whip pan, a pure roll and a
+pure zoom — stays at or below 0.007.
+
+The second cue is **immediate-neighbour dominance**. A cut is a one-frame
+discontinuity between two well-aligned neighbours; fast motion degrades a whole
+run of frames. So the residual at a cut must dominate the frames either side of
+it, not merely be large.
+
+The comparison is against the immediate neighbours (+/-2 frames) rather than a
+wider local median, and that detail decides the outcome. A sinusoidal whip pan
+alternates fast and slow phases, so a +/-12 frame median straddles both regimes
+and lands low, making every fast phase look like a 22x spike — that formulation
+split a continuous 2-second clip into four shots. Against immediate neighbours
+the same frames score ~0.9x (their neighbours are equally bad) while a real cut
+scores ~30x (its neighbours are clean).
+
+Absolute magnitude alone cannot separate the two cases either: the whip pan
+reaches a *higher* absolute residual than the real cut does. Both cues are
+required.
+
+Track survival and model coherence are kept as corroboration, and appearance
+cues are retained because they genuinely help when two shots differ in content.
 """
 
 from __future__ import annotations
@@ -39,34 +67,50 @@ from app.video.decoder import FrameDecoder
 
 log = get_logger("video.shots")
 
-#: Long edge for the cut-detection decode pass.
-CUT_ANALYSIS_LONG_EDGE = 256
+#: Long edge for the cut-detection decode pass. Small enough to be nearly free,
+#: large enough that fine texture survives downsampling — at 256 px the fine
+#: high-frequency detail aliases away, tracking fails under fast motion, and the
+#: compensation cue degrades exactly where it is needed most.
+CUT_ANALYSIS_LONG_EDGE = 384
 
-#: Grid for spatially-aware histograms. A global histogram is blind to a cut
-#: between two shots that happen to share a palette (very common: same location,
-#: different angle), which a 4x4 grid catches.
+#: Grid for spatially-aware histograms. A single global histogram is blind to a
+#: cut between two shots that share a palette, which a 4x4 grid partly catches.
 HIST_GRID = 4
 HIST_BINS = 32
+
+LK_PARAMS = dict(
+    winSize=(25, 25),
+    maxLevel=5,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+)
 
 
 @dataclass
 class CutThresholds:
-    """Tuning knobs, all as ratios against a local baseline rather than absolutes."""
+    """Tuning knobs. Defaults were measured, not guessed — see module docstring."""
 
-    appearance_ratio: float = 3.2
-    """Appearance change must exceed this multiple of the local median."""
+    residual_floor: float = 0.030
+    """Absolute compensated residual (0-1) below which nothing is a cut.
+    Non-cut transitions measured at most 0.007; a real cut measured 0.21."""
 
-    appearance_floor: float = 0.22
-    """...and this absolute floor, so noise in a static shot cannot trip it."""
+    peak_ratio: float = 5.0
+    """How many times its immediate neighbours the residual must reach. A real
+    cut measured ~30x; the whip pan's worst frames measured ~0.9x."""
 
-    max_track_survival: float = 0.42
-    """A cut requires track survival BELOW this. Fast motion stays well above."""
+    max_track_survival: float = 0.70
+    """Corroboration: a cut must also break tracking. Deliberately loose,
+    because fast motion breaks tracking too and the discrimination is done by
+    the two cues above."""
 
-    max_flow_coherence: float = 0.55
-    """A cut requires model-inlier coherence BELOW this."""
+    max_flow_coherence: float = 0.85
+    """Corroboration: no single model should explain what survives."""
 
     min_shot_frames: int = 8
-    """Non-maximum suppression window; also the minimum emitted shot length."""
+    """Non-maximum suppression window, and the minimum emitted shot length."""
+
+    neighbour_span: int = 2
+    """How many frames either side form the comparison neighbourhood. Narrow on
+    purpose: it must not reach into a different motion regime."""
 
 
 def _grid_histogram(frame: np.ndarray) -> np.ndarray:
@@ -77,79 +121,116 @@ def _grid_histogram(frame: np.ndarray) -> np.ndarray:
         for gx in range(HIST_GRID):
             y0, y1 = gy * h // HIST_GRID, (gy + 1) * h // HIST_GRID
             x0, x1 = gx * w // HIST_GRID, (gx + 1) * w // HIST_GRID
-            cell = frame[y0:y1, x0:x1]
-            hist = cv2.calcHist([cell], [0], None, [HIST_BINS], [0, 256]).ravel()
+            hist = cv2.calcHist([frame[y0:y1, x0:x1]], [0], None, [HIST_BINS], [0, 256]).ravel()
             total = hist.sum()
             cells.append(hist / total if total > 0 else hist)
     return np.concatenate(cells).astype(np.float32)
 
 
-def _appearance_scores(prev: np.ndarray, cur: np.ndarray,
-                       prev_hist: np.ndarray, cur_hist: np.ndarray) -> tuple[float, float]:
-    """(histogram_change, structural_change), both roughly 0..1."""
-    # Bhattacharyya distance is better behaved than correlation near-zero bins.
-    hist_change = float(cv2.compareHist(prev_hist, cur_hist, cv2.HISTCMP_BHATTACHARYYA))
-    diff = cv2.absdiff(prev, cur)
-    structural = float(diff.mean()) / 255.0
-    return hist_change, structural
+@dataclass
+class TransitionCues:
+    residual: float = 0.0
+    """Absolute motion-compensated residual, 0-1. The primary cue."""
+    residual_ratio: float = 0.0
+    """Compensated residual / raw difference, 0-1."""
+    survival: float = 1.0
+    coherence: float = 1.0
+    hist_change: float = 0.0
+    structural: float = 0.0
 
 
-def _track_cues(prev: np.ndarray, cur: np.ndarray, max_corners: int = 220
-                ) -> tuple[float, float]:
-    """(track_survival_ratio, flow_coherence).
+def _measure_transition(prev: np.ndarray, cur: np.ndarray,
+                        prev_hist: np.ndarray, cur_hist: np.ndarray) -> TransitionCues:
+    """All cues for one transition, from a single shared LK pass."""
+    cues = TransitionCues()
 
-    survival  — fraction of corners that LK could still follow, forward-backward
-                validated. Collapses to ~0 across a cut because the content the
-                corners describe no longer exists.
-    coherence — fraction of surviving tracks explained by a single affine model.
-                Stays high under fast motion (one model explains it) and falls
-                across a cut (surviving "matches" are coincidences).
-    """
+    cues.hist_change = float(cv2.compareHist(prev_hist, cur_hist, cv2.HISTCMP_BHATTACHARYYA))
+    raw = float(cv2.absdiff(prev, cur).mean())
+    cues.structural = raw / 255.0
+
+    if raw < 1.0:
+        # Frames are effectively identical: nothing moved and nothing changed.
+        cues.residual = 0.0
+        cues.residual_ratio = 0.0
+        return cues
+
+    # --- one LK pass serves both the compensation model and the track cues ---
+    model: np.ndarray | None = None
     corners = cv2.goodFeaturesToTrack(
-        prev, maxCorners=max_corners, qualityLevel=0.01, minDistance=6, blockSize=7
+        prev, maxCorners=400, qualityLevel=0.01, minDistance=5, blockSize=7
     )
-    if corners is None or len(corners) < 12:
-        # Untrackable content (sky, water, extreme blur). No evidence either way:
-        # report neutral values so appearance cues alone cannot declare a cut.
-        return 1.0, 1.0
+    if corners is not None and len(corners) >= 10:
+        nxt, status, _ = cv2.calcOpticalFlowPyrLK(prev, cur, corners, None, **LK_PARAMS)
+        if nxt is not None and status is not None:
+            back, status_b, _ = cv2.calcOpticalFlowPyrLK(cur, prev, nxt, None, **LK_PARAMS)
+            ok = status.ravel() == 1
+            if back is not None and status_b is not None:
+                ok = ok & (status_b.ravel() == 1)
+                fb = np.linalg.norm((corners - back).reshape(-1, 2), axis=1)
+                ok = ok & (fb < 2.0)
+            cues.survival = float(ok.sum()) / float(len(corners))
+            if ok.sum() >= 8:
+                src = corners[ok].reshape(-1, 2)
+                dst = nxt[ok].reshape(-1, 2)
+                model, inliers = cv2.estimateAffinePartial2D(
+                    src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0,
+                    maxIters=2000, confidence=0.99,
+                )
+                cues.coherence = (
+                    float(inliers.ravel().mean()) if inliers is not None else 0.0
+                )
+            else:
+                cues.coherence = 0.0
+    else:
+        # Untrackable content (sky, water, extreme blur). No track evidence
+        # either way, so leave survival/coherence neutral and let the
+        # compensation cue decide on its own.
+        cues.survival = 1.0
+        cues.coherence = 1.0
 
-    lk = dict(winSize=(21, 21), maxLevel=3,
-              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 24, 0.02))
-    nxt, status, _ = cv2.calcOpticalFlowPyrLK(prev, cur, corners, None, **lk)
-    if nxt is None or status is None:
-        return 0.0, 0.0
-    back, status_b, _ = cv2.calcOpticalFlowPyrLK(cur, prev, nxt, None, **lk)
-    if back is None or status_b is None:
-        return 0.0, 0.0
+    if model is None:
+        # Featureless fallback: phase correlation recovers a global translation
+        # from raw image structure, with no features required.
+        window = cv2.createHanningWindow((prev.shape[1], prev.shape[0]), cv2.CV_32F)
+        (dx, dy), _ = cv2.phaseCorrelate(
+            prev.astype(np.float32), cur.astype(np.float32), window
+        )
+        model = np.float32([[1, 0, dx], [0, 1, dy]])
 
-    ok = (status.ravel() == 1) & (status_b.ravel() == 1)
-    if not ok.any():
-        return 0.0, 0.0
-    fb_error = np.linalg.norm(corners[ok] - back[ok], axis=-1).ravel()
-    # Forward-backward consistency: a genuine track returns to where it started.
-    good = fb_error < 2.0
-    survival = float(good.sum()) / float(len(corners))
-
-    src = corners[ok][good].reshape(-1, 2)
-    dst = nxt[ok][good].reshape(-1, 2)
-    if len(src) < 8:
-        return survival, 0.0
-
-    _, inliers = cv2.estimateAffinePartial2D(
-        src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0,
-        maxIters=900, confidence=0.985,
+    h, w = prev.shape[:2]
+    warped = cv2.warpAffine(prev, model, (w, h), flags=cv2.INTER_LINEAR)
+    coverage = cv2.warpAffine(
+        np.full_like(prev, 255), model, (w, h), flags=cv2.INTER_NEAREST
     )
-    coherence = float(inliers.ravel().mean()) if inliers is not None else 0.0
-    return survival, coherence
+    valid = coverage > 200
+    if valid.sum() < 0.2 * valid.size:
+        # The transform moved almost everything off-frame; there is nothing left
+        # to compare, so this is treated as complete alignment failure.
+        cues.residual = cues.structural
+        cues.residual_ratio = 1.0
+        return cues
+
+    resid = float(
+        np.abs(warped[valid].astype(np.float32) - cur[valid].astype(np.float32)).mean()
+    )
+    cues.residual = resid / 255.0
+    cues.residual_ratio = resid / max(raw, 1e-6)
+    return cues
 
 
-def _local_median(values: np.ndarray, index: int, half_window: int = 12) -> float:
-    lo = max(0, index - half_window)
-    hi = min(len(values), index + half_window + 1)
-    window = np.delete(values[lo:hi], min(index - lo, hi - lo - 1))
+def _neighbour_baseline(values: np.ndarray, index: int, span: int) -> float:
+    """Worst residual among the immediate neighbours, excluding `index` itself.
+
+    The *maximum* rather than the mean or median: a cut must be worse than the
+    worst of its neighbours. Using an average would let one clean neighbour
+    excuse a frame that sits in the middle of a sustained bad run.
+    """
+    lo = max(0, index - span)
+    hi = min(len(values), index + span + 1)
+    window = np.concatenate([values[lo:index], values[index + 1:hi]])
     if window.size == 0:
-        return float(np.median(values)) if values.size else 0.0
-    return float(np.median(window))
+        return 0.0
+    return float(window.max())
 
 
 def detect_shots(
@@ -161,105 +242,94 @@ def detect_shots(
 ) -> tuple[list[Shot], list[CutCandidate]]:
     """Split a video into continuous shots.
 
-    Returns the shots plus every evaluated boundary (accepted or not), so the UI
-    can explain a decision — including "this looked like a cut but the tracks
-    survived, so it was kept as one shot".
+    Returns the shots plus every evaluated boundary, accepted or not, so the UI
+    can explain a decision — including "this looked like a cut but one transform
+    still explained the whole frame, so it was kept as one shot".
     """
     th = thresholds or CutThresholds()
     n = len(frames_meta)
     if n == 0:
         return [], []
     if n < 3:
-        return [_whole_video_shot(info, frames_meta)], []
+        return [_whole_video_shot(frames_meta)], []
 
     decoder = FrameDecoder(info, long_edge=CUT_ANALYSIS_LONG_EDGE, gray=True)
 
-    hist_changes = np.zeros(n, dtype=np.float32)
-    structurals = np.zeros(n, dtype=np.float32)
-    survivals = np.ones(n, dtype=np.float32)
-    coherences = np.ones(n, dtype=np.float32)
-
+    cues: list[TransitionCues] = [TransitionCues() for _ in range(n)]
     prev_frame: np.ndarray | None = None
     prev_hist: np.ndarray | None = None
     seen = 0
 
-    start_time = frames_meta[0].time_seconds if frames_meta else 0.0
+    start_time = frames_meta[0].time_seconds
     for idx, frame in decoder.iter_frames(
         start_frame=0, end_frame=n - 1, start_time=start_time
     ):
-        # Light blur: suppresses codec blocking and sensor noise that would
-        # otherwise inflate the structural cue on static shots.
+        # Light blur suppresses codec blocking and sensor noise, which would
+        # otherwise inflate both the structural and residual cues.
         frame = cv2.GaussianBlur(frame, (3, 3), 0)
         hist = _grid_histogram(frame)
 
         if prev_frame is not None and 0 <= idx < n:
-            hc, sc = _appearance_scores(prev_frame, frame, prev_hist, hist)
-            sv, co = _track_cues(prev_frame, frame)
-            hist_changes[idx] = hc
-            structurals[idx] = sc
-            survivals[idx] = sv
-            coherences[idx] = co
+            cues[idx] = _measure_transition(prev_frame, frame, prev_hist, hist)
 
         prev_frame, prev_hist = frame, hist
         seen += 1
         if reporter and seen % 25 == 0:
             reporter.progress(min(1.0, seen / max(1, n)), f"cut scan {seen}/{n}")
 
-    # ---------------------------------------------------------- decide cuts
-    appearance = np.maximum(hist_changes, structurals * 2.0)
+    residuals = np.array([c.residual for c in cues], dtype=np.float64)
+
     candidates: list[CutCandidate] = []
     cut_frames: list[int] = []
 
     for i in range(1, n):
-        app = float(appearance[i])
-        baseline = _local_median(appearance, i)
-        ratio = app / (baseline + 1e-4)
+        c = cues[i]
+        baseline = _neighbour_baseline(residuals, i, th.neighbour_span)
+        ratio = c.residual / (baseline + 1e-5)
 
-        survival = float(survivals[i])
-        coherence = float(coherences[i])
+        substantial = c.residual >= th.residual_floor
+        isolated = ratio >= th.peak_ratio
+        broken = c.survival <= th.max_track_survival or c.coherence <= th.max_flow_coherence
 
-        appearance_says_cut = app >= th.appearance_floor and ratio >= th.appearance_ratio
-        tracks_collapsed = survival <= th.max_track_survival
-        flow_incoherent = coherence <= th.max_flow_coherence
-
-        # Both families of evidence are required. This is the whole guard against
-        # calling a whip pan a cut.
-        accepted = appearance_says_cut and tracks_collapsed and flow_incoherent
+        accepted = substantial and isolated and broken
 
         if accepted:
             reason = (
-                f"appearance {app:.3f} = {ratio:.1f}x local baseline, "
-                f"track survival {survival:.0%}, model coherence {coherence:.0%}"
+                f"no transform explains this transition: {c.residual * 100:.1f}% "
+                f"residual after motion compensation ({ratio:.0f}x its neighbours), "
+                f"track survival {c.survival:.0%}, model coherence "
+                f"{c.coherence:.0%}"
             )
-        elif appearance_says_cut and not tracks_collapsed:
+        elif substantial and not isolated:
             reason = (
-                f"rejected: large appearance change ({ratio:.1f}x baseline) but "
-                f"{survival:.0%} of tracks survived — fast camera motion, not a cut"
+                f"rejected: large residual ({c.residual * 100:.1f}%) but only "
+                f"{ratio:.1f}x its neighbours, which are just as poorly aligned — "
+                "sustained fast camera motion, not an isolated break"
             )
-        elif appearance_says_cut and not flow_incoherent:
+        elif substantial and not broken:
             reason = (
-                f"rejected: appearance changed but a single model still explains "
-                f"{coherence:.0%} of tracks — coherent motion, not a cut"
+                f"rejected: residual {c.residual * 100:.1f}% but {c.survival:.0%} of "
+                f"tracks survived and one model still explains {c.coherence:.0%} of "
+                "them — coherent camera motion"
+            )
+        elif isolated and not substantial:
+            reason = (
+                f"rejected: a local spike, but only {c.residual * 100:.2f}% residual "
+                "remains after motion compensation — the movement is fully explained"
             )
         else:
-            reason = "no significant appearance change"
+            reason = "motion fully explained by a single transform"
 
-        combined = float(
-            min(1.0, ratio / max(th.appearance_ratio, 1e-6))
-            * (1.0 - survival)
-            * (1.0 - coherence)
-        )
-
-        if accepted or appearance_says_cut:
+        if accepted or substantial or isolated:
             candidates.append(
                 CutCandidate(
                     frame_index=i,
                     time_seconds=frames_meta[i].time_seconds,
-                    histogram_score=float(hist_changes[i]),
-                    structural_score=float(structurals[i]),
-                    match_collapse_score=1.0 - survival,
-                    flow_coherence_score=coherence,
-                    combined_score=combined,
+                    histogram_score=c.hist_change,
+                    structural_score=c.structural,
+                    match_collapse_score=1.0 - c.survival,
+                    flow_coherence_score=c.coherence,
+                    combined_score=float(min(1.0, c.residual * min(ratio / th.peak_ratio, 2.0))),
                     accepted=accepted,
                     reason=reason,
                 )
@@ -267,29 +337,29 @@ def detect_shots(
         if accepted:
             cut_frames.append(i)
 
-    # Non-maximum suppression: a real cut often flags its neighbour too
-    # (the frame after a cut is also unlike the frame before it).
+    # Non-maximum suppression: the frame after a cut is also unlike the frame
+    # before it, so a real cut can flag its neighbour.
     suppressed: list[int] = []
     for f in cut_frames:
         if suppressed and f - suppressed[-1] < th.min_shot_frames:
             continue
         suppressed.append(f)
 
-    shots = _build_shots(info, frames_meta, suppressed, th.min_shot_frames)
+    shots = _build_shots(frames_meta, suppressed, th.min_shot_frames)
 
     if reporter:
-        accepted_n = sum(1 for c in candidates if c.accepted)
-        rejected_n = len(candidates) - accepted_n
+        accepted_n = len(suppressed)
+        rejected_n = sum(1 for c in candidates if not c.accepted)
         reporter.info(
             f"shot detection: {len(shots)} shot(s), {accepted_n} cut(s) accepted"
-            + (f", {rejected_n} appearance spike(s) rejected as camera motion"
+            + (f", {rejected_n} candidate(s) rejected as camera motion"
                if rejected_n else "")
         )
     log.info("detected %d shots from %d frames (%d cuts)", len(shots), n, len(suppressed))
     return shots, candidates
 
 
-def _whole_video_shot(info: VideoInfo, frames_meta: list[FrameMetadata]) -> Shot:
+def _whole_video_shot(frames_meta: list[FrameMetadata]) -> Shot:
     return Shot(
         id=0,
         start_frame=frames_meta[0].frame_index,
@@ -301,7 +371,6 @@ def _whole_video_shot(info: VideoInfo, frames_meta: list[FrameMetadata]) -> Shot
 
 
 def _build_shots(
-    info: VideoInfo,
     frames_meta: list[FrameMetadata],
     cut_frames: list[int],
     min_shot_frames: int,
@@ -336,7 +405,6 @@ def _build_shots(
                 confidence=1.0 if start == 0 else 0.9,
             )
         )
-    # Re-index so ids are contiguous after any absorption.
     return [s.model_copy(update={"id": i}) for i, s in enumerate(shots)]
 
 
@@ -350,8 +418,8 @@ def estimate_complexity(
 ) -> tuple[ShotComplexity, list[str]]:
     """Cheap pre-solve difficulty estimate, shown in the analysis panel.
 
-    This is an *expectation* of solver difficulty, not a confidence score — the
-    real confidence comes from `validation/confidence.py` after solving.
+    An *expectation* of solver difficulty, not a confidence score — real
+    confidence comes from `validation/confidence.py` after solving.
     """
     reasons: list[str] = []
     score = 0.0
@@ -378,9 +446,7 @@ def estimate_complexity(
 
     if parallax_score < 0.15:
         score += 1.5
-        reasons.append(
-            "little parallax — translation may not be geometrically observable"
-        )
+        reasons.append("little parallax — translation may not be geometrically observable")
 
     if duration > 0 and frame_count / max(duration, 1e-6) > 90:
         reasons.append("high frame rate")

@@ -29,7 +29,12 @@ LK_PARAMS = dict(
     maxLevel=4,
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
     flags=cv2.OPTFLOW_LK_GET_MIN_EIGENVALS,
-    minEigThreshold=1e-4,
+    # OpenCV's default is 1e-4, which rejects every point on low-contrast
+    # footage (see features.normalize_contrast). 1e-5 still discards genuinely
+    # degenerate structure — a flat or purely 1-D gradient patch, where the
+    # aperture problem makes the flow unrecoverable — without throwing away
+    # usable low-contrast texture.
+    minEigThreshold=1e-5,
 )
 
 #: Forward-backward round-trip tolerance, pixels.

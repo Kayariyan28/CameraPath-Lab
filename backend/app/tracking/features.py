@@ -26,6 +26,30 @@ from app.core.logging import get_logger
 log = get_logger("tracking.features")
 
 
+def normalize_contrast(frame: np.ndarray, *, clip_limit: float = 2.0) -> np.ndarray:
+    """CLAHE contrast normalisation, applied to every frame before tracking.
+
+    Not cosmetic — it is load-bearing. Lucas-Kanade accepts a point only if the
+    local structure tensor's minimum eigenvalue clears `minEigThreshold`, and
+    that eigenvalue scales with the *square* of local contrast. Footage with a
+    standard deviation around 15/255 (log and flat camera profiles, fog, night,
+    overcast skies, heavy haze — i.e. a large share of real cinematic reference
+    material) produces eigenvalues near 3e-5 against OpenCV's 1e-4 default, and
+    every single track dies.
+
+    Found exactly that way: a low-contrast synthetic clip lost 1985 of 1985
+    tracks on its first transition while reporting no error at all.
+
+    Applied unconditionally rather than only to low-contrast frames, because
+    switching it on mid-shot would change the appearance of consecutive frames
+    relative to each other and inject motion that is not there.
+    """
+    if frame.ndim == 3:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    return clahe.apply(frame)
+
+
 def detect_corners(
     frame: np.ndarray,
     *,

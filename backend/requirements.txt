@@ -17,3 +17,4 @@ opencv-contrib-python>=4.10,<5
 
 # --- classical 3D reconstruction (Phase 2) ---
 pycolmap>=3.11,<5
+pydantic-settings>=2.6

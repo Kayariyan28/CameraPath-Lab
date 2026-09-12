@@ -146,8 +146,11 @@ class StageReporter:
         self.log = get_logger(f"job.{job_id[:8]}")
         self._stage: str | None = None
         self._shot_id: int | None = None
+        self._shot_index: int = 0
+        self._shot_count: int = 1
         self._lock = threading.Lock()
         self._total_weight = sum(self.STAGE_WEIGHTS.values())
+        self._last_overall: float = 0.0
 
     # -------------------------------------------------------------- internals
 
@@ -171,22 +174,49 @@ class StageReporter:
         self.bus.publish(event)
 
     def _overall_progress(self, stage: str, local: float) -> float:
-        """Map (stage, local fraction) onto a monotonic global fraction."""
+        """Map (stage, local fraction) onto a monotonic global fraction.
+
+        Monotonicity is enforced rather than assumed: stages can legitimately be
+        skipped or revisited (a solver falling back down the ladder re-enters an
+        earlier stage), and a progress bar that rewinds reads as a malfunction.
+        """
+        local = max(0.0, min(1.0, local))
+        # Fold per-shot progress into this shot's slice of the stage.
+        if self._shot_count > 1:
+            local = (self._shot_index + local) / self._shot_count
+
         done = 0
+        value = min(1.0, sum(self.STAGE_WEIGHTS.values()) / self._total_weight)
         for name, weight in self.STAGE_WEIGHTS.items():
             if name == stage:
-                return (done + weight * max(0.0, min(1.0, local))) / self._total_weight
+                value = (done + weight * local) / self._total_weight
+                break
             done += weight
-        return min(1.0, done / self._total_weight)
+        else:
+            value = min(1.0, done / self._total_weight)
+
+        with self._lock:
+            if value < self._last_overall:
+                value = self._last_overall
+            else:
+                self._last_overall = value
+        return value
 
     # ----------------------------------------------------------------- public
 
-    def set_shot(self, shot_id: int | None) -> None:
+    def set_shot(self, shot_id: int | None, *, index: int = 0, count: int = 1) -> None:
+        """Scope subsequent progress to one shot of `count`.
+
+        Without this a 3-shot job runs each per-shot stage from 0 to 100% three
+        times and the bar visibly rewinds twice. `index`/`count` compress each
+        shot's local progress into its own slice of the stage.
+        """
         self._shot_id = shot_id
+        self._shot_index = max(0, index)
+        self._shot_count = max(1, count)
 
     def stage(self, stage: str, message: str = "") -> None:
-        with self._lock:
-            self._stage = stage
+        self._stage = stage
         self.log.info("stage=%s %s", stage, message)
         self._emit(
             JobEvent(

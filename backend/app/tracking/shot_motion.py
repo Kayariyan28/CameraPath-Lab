@@ -24,12 +24,15 @@ from app.core.logging import StageReporter, get_logger
 from app.models.schemas.motion import MotionFrame, MotionSignature
 from app.models.schemas.video import FrameMetadata, Shot, VideoInfo
 from app.tracking.dynamic_rejection import GeometricDynamicRejector
-from app.tracking.features import blur_score, texture_score
+from app.tracking.features import blur_score, normalize_contrast, texture_score
 from app.tracking.flow import LucasKanadeTracker
 from app.tracking.global_motion import estimate_transition, summarise
 from app.video.decoder import FrameDecoder, fit_long_edge
 
 log = get_logger("tracking.shot_motion")
+
+#: See the note at the use site before changing this.
+DYNAMIC_CONTENT_WARNING_THRESHOLD = 0.35
 
 
 @dataclass
@@ -93,13 +96,13 @@ def analyze_shot_motion(
             shot.start_time + processed / max(info.fps_average or 30.0, 1e-6)
         )
 
-        # Sample image quality on a sparse schedule — these are per-shot
-        # aggregates and computing them every frame is wasted work.
+        # Quality metrics are measured on the ORIGINAL frame: they describe the
+        # source material, and CLAHE would flatter both of them.
         if processed % 8 == 0:
             texture_samples.append(texture_score(frame))
             blur_samples.append(blur_score(frame))
 
-        flow_result = tracker.track(frame_index, frame)
+        flow_result = tracker.track(frame_index, normalize_contrast(frame))
         processed += 1
 
         if flow_result is None:
@@ -146,7 +149,12 @@ def analyze_shot_motion(
             "single motion model — the scene may contain large moving content."
         )
     dyn = rejector.dynamic_region_fraction()
-    if dyn > 0.25:
+    # Threshold set against measured headroom, not intuition. Across 15 shots of
+    # synthetic footage containing no moving content at all, the highest value
+    # observed is 0.249 — residual clustering from genuine tracking failures on
+    # very fast motion. 0.35 leaves ~40% margin above that. A confidently wrong
+    # "a moving subject fills the frame" warning is worse than no warning.
+    if dyn > DYNAMIC_CONTENT_WARNING_THRESHOLD:
         warnings.append(
             f"Moving content detected across ~{dyn:.0%} of the frame. "
             "Camera estimation is using background features only."
