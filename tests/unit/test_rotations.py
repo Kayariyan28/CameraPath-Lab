@@ -292,3 +292,14 @@ class TestUnroll:
         raw = float(np.abs(np.diff(seq, axis=0)).max())
         rolled = float(np.abs(np.diff(unroll_quaternions(seq), axis=0)).max())
         assert raw > 1.0 and rolled < 1e-9
+
+
+def test_quat_angle_is_precise_near_identity():
+    """2*arccos(w) turns float32-level noise into ~0.05 deg of phantom rotation."""
+    from app.geometry.rotations import quat_angle, quat_from_axis_angle
+    for angle in (1e-6, 1e-4, 1e-2, 0.5, 3.0):
+        q = quat_from_axis_angle(np.array([0.3, -0.5, 0.8]), angle)
+        assert abs(quat_angle(q) - angle) < 1e-12 * max(1.0, angle)
+    # A float32-noisy identity must read as a tiny angle, not tenths of a degree.
+    noisy = np.array([1.0, 3e-8, -2e-8, 1e-8], dtype=np.float32).astype(np.float64)
+    assert np.degrees(quat_angle(noisy)) < 1e-5

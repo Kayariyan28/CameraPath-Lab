@@ -119,9 +119,16 @@ def quat_canonical(q: np.ndarray) -> np.ndarray:
 
 
 def quat_angle(q: np.ndarray) -> float:
-    """Rotation magnitude in radians, in [0, pi]."""
+    """Rotation magnitude in radians, in [0, pi].
+
+    Computed as 2*atan2(|v|, w), not 2*arccos(w). arccos has infinite slope at 1,
+    so near-identity rotations — exactly the per-frame and residual-error angles
+    this codebase measures most — lose most of their precision: a 1e-7 wobble in
+    w (float32 storage, as in Blender) reads as ~0.05 deg. Found when a
+    Blender round trip exact to 1e-5 deg reported 0.039 deg of error.
+    """
     q = quat_canonical(quat_normalize(q))
-    return float(2.0 * np.arccos(np.clip(q[0], -1.0, 1.0)))
+    return float(2.0 * np.arctan2(np.linalg.norm(q[1:]), q[0]))
 
 
 def quat_relative(a: np.ndarray, b: np.ndarray) -> np.ndarray:
