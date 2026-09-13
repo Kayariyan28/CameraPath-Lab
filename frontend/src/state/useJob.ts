@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, subscribeToJob } from '../api/client'
-import type { Job, JobEvent, ShotMotionPayload, SolveSettings } from '../api/types'
+import type { Job, JobEvent, OutputsListing, ShotMotionPayload, SolveSettings } from '../api/types'
 
 export interface JobController {
   job: Job | null
@@ -11,11 +11,18 @@ export interface JobController {
   uploadFraction: number | null
   error: string | null
   motion: Record<number, ShotMotionPayload>
+  outputs: OutputsListing | null
 
   upload: (file: File) => Promise<void>
   analyze: (settings?: Partial<SolveSettings>) => Promise<void>
+  /** Solve every shot, export, and render the motion proxy. */
+  solve: (settings?: Partial<SolveSettings>) => Promise<void>
+  /** Re-render with new output settings; geometry is not recomputed. */
+  render: (settings?: Partial<SolveSettings>) => Promise<void>
   cancel: () => Promise<void>
   reset: () => void
+  /** Load an existing job, e.g. from a `?job=` link, so results survive reloads. */
+  open: (jobId: string) => Promise<void>
   loadMotion: (shotId: number) => Promise<void>
 }
 
@@ -32,6 +39,7 @@ export function useJob(): JobController {
   const [uploadFraction, setUploadFraction] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [motion, setMotion] = useState<Record<number, ShotMotionPayload>>({})
+  const [outputs, setOutputs] = useState<OutputsListing | null>(null)
 
   const unsubscribe = useRef<(() => void) | null>(null)
   const jobId = job?.id ?? null
@@ -40,7 +48,12 @@ export function useJob(): JobController {
   // event stream carries progress; the job record carries results.
   const refresh = useCallback(async (id: string) => {
     try {
-      setJob(await api.getJob(id))
+      const next = await api.getJob(id)
+      setJob(next)
+      // Output files change only when a solve or render finishes.
+      if (next.state === 'complete' || next.state === 'solved' || next.state === 'failed') {
+        api.outputs(id).then(setOutputs).catch(() => setOutputs(null))
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
@@ -80,6 +93,7 @@ export function useJob(): JobController {
     setStage('')
     setMotion({})
     setUploadFraction(0)
+    setOutputs(null)
     try {
       // A fresh job per upload keeps each source video's artefacts isolated.
       const created = await api.createJob()
@@ -107,6 +121,32 @@ export function useJob(): JobController {
     }
   }, [jobId])
 
+  const solve = useCallback(async (settings?: Partial<SolveSettings>) => {
+    if (!jobId) return
+    setError(null)
+    setBusy(true)
+    setProgress(0)
+    try {
+      await api.solve(jobId, settings, true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setBusy(false)
+    }
+  }, [jobId])
+
+  const render = useCallback(async (settings?: Partial<SolveSettings>) => {
+    if (!jobId) return
+    setError(null)
+    setBusy(true)
+    setProgress(0)
+    try {
+      await api.render(jobId, settings)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setBusy(false)
+    }
+  }, [jobId])
+
   const cancel = useCallback(async () => {
     if (!jobId) return
     try {
@@ -127,15 +167,27 @@ export function useJob(): JobController {
     })
   }, [jobId])
 
+  const open = useCallback(async (id: string) => {
+    setError(null); setEvents([]); setMotion({}); setOutputs(null)
+    try {
+      const loaded = await api.getJob(id)
+      setJob(loaded)
+      setBusy(['analyzing', 'solving', 'rendering'].includes(loaded.state))
+      api.outputs(id).then(setOutputs).catch(() => setOutputs(null))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }, [])
+
   const reset = useCallback(() => {
     unsubscribe.current?.()
     unsubscribe.current = null
     setJob(null); setEvents([]); setProgress(0); setStage('')
-    setBusy(false); setError(null); setMotion({}); setUploadFraction(null)
+    setBusy(false); setError(null); setMotion({}); setUploadFraction(null); setOutputs(null)
   }, [])
 
   return {
-    job, events, progress, stage, busy, uploadFraction, error, motion,
-    upload, analyze, cancel, reset, loadMotion,
+    job, events, progress, stage, busy, uploadFraction, error, motion, outputs,
+    upload, analyze, solve, render, cancel, reset, loadMotion, open,
   }
 }

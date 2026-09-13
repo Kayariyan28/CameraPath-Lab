@@ -178,5 +178,6 @@ def score(scene, d):
               f"{(e[~inside].mean() if (~inside).any() else 0):8.3f} {e.max():7.3f} {jc:12.3f}")
 
 
-for s in sys.argv[1:]:
-    score(s, prepare(s))
+if __name__ == "__main__":
+    for s in sys.argv[1:]:
+        score(s, prepare(s))

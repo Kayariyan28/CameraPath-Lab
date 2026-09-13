@@ -1,6 +1,6 @@
 import type {
-  AnalysisResult, EnvironmentInfo, HealthInfo, Job, JobEvent,
-  ShotMotionPayload, SolveSettings,
+  AnalysisResult, EnvironmentInfo, HealthInfo, Job, JobEvent, OutputsListing,
+  ShotMotionPayload, ShotTrajectory, SolveSettings,
 } from './types'
 
 const BASE = '/api'
@@ -89,6 +89,27 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(settings ?? {}),
     }),
+
+  /** Geometry, fusion, validation and exports — plus the proxy render unless
+   *  `render` is false. */
+  solve: (id: string, settings?: Partial<SolveSettings>, render = true) =>
+    request<{ job_id: string; started: boolean }>(`/jobs/${id}/solve?render=${render}`, {
+      method: 'POST',
+      body: JSON.stringify(settings ?? {}),
+    }),
+
+  /** Re-render only; the backend reads the exported trajectory, so no geometry
+   *  is recomputed. Only output-side settings are applied. */
+  render: (id: string, settings?: Partial<SolveSettings>) =>
+    request<{ job_id: string; started: boolean }>(`/jobs/${id}/render`, {
+      method: 'POST',
+      body: JSON.stringify(settings ?? {}),
+    }),
+
+  trajectory: (id: string) =>
+    request<{ job_id: string; shots: ShotTrajectory[] }>(`/jobs/${id}/trajectory`),
+  outputs: (id: string) => request<OutputsListing>(`/jobs/${id}/outputs`),
+  outputUrl: (id: string, name: string) => `${BASE}/jobs/${id}/outputs/${encodeURIComponent(name)}`,
 
   cancel: (id: string) =>
     request<{ cancelling: boolean }>(`/jobs/${id}/cancel`, { method: 'POST' }),

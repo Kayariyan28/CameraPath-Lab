@@ -1,19 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api/client'
 import type { HealthInfo, SolveSettings } from './api/types'
+import { KinematicsCurves } from './charts/KinematicsCurves'
 import { MotionCurves } from './charts/MotionCurves'
 import { AnalysisPanel } from './components/AnalysisPanel'
 import { Controls } from './components/Controls'
 import { Dropzone, FileSummary } from './components/Dropzone'
 import { LogPanel } from './components/LogPanel'
+import { ResultsPanel } from './components/ResultsPanel'
 import { StageStatus } from './components/StageStatus'
 import { Timeline } from './components/Timeline'
 import { TopBar } from './components/TopBar'
 import { VideoInfoPanel } from './components/VideoInfoPanel'
 import { useJob } from './state/useJob'
 import { MotionPathView } from './trajectory/MotionPathView'
+import { TrajectoryView } from './trajectory/TrajectoryView'
 
-type BottomTab = 'curves' | 'log'
+type BottomTab = 'kinematics' | 'curves' | 'log'
+type RightTab = 'results' | 'analysis'
 
 export function App() {
   const job = useJob()
@@ -26,12 +30,24 @@ export function App() {
   const [selectedShot, setSelectedShot] = useState(0)
   const [cursorTime, setCursorTime] = useState<number | null>(null)
   const [bottomTab, setBottomTab] = useState<BottomTab>('curves')
+  const [rightTab, setRightTab] = useState<RightTab>('analysis')
   const [health, setHealth] = useState<HealthInfo | null>(null)
   const video = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
     api.health().then(setHealth).catch(() => setHealth(null))
+    const linked = new URLSearchParams(window.location.search).get('job')
+    if (linked) void job.open(linked)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Keep the URL pointing at the current job so a reload reopens it.
+  useEffect(() => {
+    const url = new URL(window.location.href)
+    if (job.job?.id) url.searchParams.set('job', job.job.id)
+    else url.searchParams.delete('job')
+    window.history.replaceState(null, '', url)
+  }, [job.job?.id])
 
   const analysis = job.job?.analysis ?? null
   const info = job.job?.video ?? null
@@ -45,6 +61,14 @@ export function App() {
   }, [analysis, selectedShot])
 
   useEffect(() => { setSelectedShot(0) }, [job.job?.id])
+
+  const trajectory = job.job?.trajectories?.find((t) => t.shot_id === selectedShot) ?? null
+  const hasTrajectory = (job.job?.trajectories?.length ?? 0) > 0
+
+  // When a solve lands, show what it produced.
+  useEffect(() => {
+    if (hasTrajectory) { setRightTab('results'); setBottomTab('kinematics') }
+  }, [hasTrajectory, job.job?.id])
 
   const motion = job.motion[selectedShot]
   const frames = motion?.motion_frames ?? []
@@ -63,6 +87,8 @@ export function App() {
   }
 
   const canAnalyze = Boolean(job.job?.video) && !job.busy
+  const canGenerate = Boolean(analysis) && !job.busy
+  const aspect = info ? info.width / Math.max(info.height, 1) : 16 / 9
   const analysisSize = useMemo(
     () => motion?.analysis_size ?? analysis?.analysis_resolution ?? [1080, 608],
     [motion, analysis],
@@ -130,17 +156,41 @@ export function App() {
                 />
 
                 <div className="section">
-                  <button
-                    className="btn primary cta"
-                    disabled={!canAnalyze}
-                    onClick={() => void job.analyze(settings)}
-                  >
-                    {job.busy ? 'Analysing…' : analysis ? 'Re-analyse' : 'Analyse video'}
-                  </button>
-                  <div className="tiny dimmer" style={{ marginTop: 7, textAlign: 'center' }}>
-                    Generating the motion reference MP4 needs the geometric solve and
-                    Blender render, which land in phases 2–3.
-                  </div>
+                  {analysis ? (
+                    <>
+                      <button
+                        className="btn primary cta cta-generate"
+                        disabled={!canGenerate}
+                        onClick={() => void job.solve(settings)}
+                      >
+                        {job.busy ? 'Working…' : hasTrajectory ? 'REGENERATE MOTION REFERENCE' : 'GENERATE MOTION REFERENCE'}
+                      </button>
+                      <div className="row" style={{ marginTop: 7, gap: 6 }}>
+                        <button className="btn sm" disabled={!canAnalyze} onClick={() => void job.analyze(settings)}>
+                          Re-analyse
+                        </button>
+                        {hasTrajectory && (
+                          <button className="btn sm" disabled={job.busy || !(health?.can_render ?? true)}
+                            title="Re-render with the current proxy style and output size; geometry is not recomputed"
+                            onClick={() => void job.render(settings)}>
+                            Re-render proxy only
+                          </button>
+                        )}
+                      </div>
+                      <div className="tiny dimmer" style={{ marginTop: 7 }}>
+                        Solves the camera, exports the trajectory and renders the neutral motion
+                        proxy MP4. Timing follows the source exactly.
+                      </div>
+                    </>
+                  ) : (
+                    <button
+                      className="btn primary cta"
+                      disabled={!canAnalyze}
+                      onClick={() => void job.analyze(settings)}
+                    >
+                      {job.busy ? 'Analysing…' : 'Analyse video'}
+                    </button>
+                  )}
                 </div>
               </>
             )}
@@ -154,14 +204,20 @@ export function App() {
         {/* --------------------------------------------- CENTRE: 3D viewport */}
         <section className="pane">
           <div className="pane-head">
-            Motion path
+            {trajectory ? 'Camera trajectory' : 'Motion path'}
             <span className="spacer" />
-            {frames.length > 0 && (
+            {trajectory ? (
+              <span className={`badge ${trajectory.pipeline_mode_used === 'physical_3d' ? 'ok' : 'warn'}`}>
+                {trajectory.pipeline_mode_used === 'physical_3d' ? 'recovered 3D camera path' : 'perceptual match · screen-space equivalent'}
+              </span>
+            ) : frames.length > 0 && (
               <span className="badge warn">image-space · not yet a 3D camera path</span>
             )}
           </div>
           <div className="pane-body" style={{ overflow: 'hidden' }}>
-            {frames.length > 0 ? (
+            {trajectory ? (
+              <TrajectoryView trajectory={trajectory} cursorTime={cursorTime} aspect={aspect} />
+            ) : frames.length > 0 ? (
               <MotionPathView
                 frames={frames}
                 cursorTime={cursorTime}
@@ -172,9 +228,8 @@ export function App() {
                 <div style={{ fontSize: 22, opacity: 0.35 }}>◈</div>
                 <div>{job.job?.video ? 'Run analysis to see the motion path' : 'No video loaded'}</div>
                 <div className="tiny dimmer" style={{ maxWidth: 380 }}>
-                  This viewport shows the measured image-space motion. Once the geometric
-                  solve lands it shows the recovered 3D camera trajectory with keyframe
-                  frustums in the same view.
+                  After analysis this shows the measured image-space motion; after
+                  Generate it shows the recovered camera trajectory with keyframe frustums.
                 </div>
               </div>
             )}
@@ -184,8 +239,14 @@ export function App() {
         {/* ------------------------------------------- RIGHT: camera analysis */}
         <section className="pane">
           <div className="pane-head">
-            Camera analysis
-            {analysis && (
+            {hasTrajectory ? (
+              <div className="tabs">
+                <button className={`tab ${rightTab === 'results' ? 'active' : ''}`} onClick={() => setRightTab('results')}>Results</button>
+                <button className={`tab ${rightTab === 'analysis' ? 'active' : ''}`} onClick={() => setRightTab('analysis')}>Analysis</button>
+              </div>
+            ) : 'Camera analysis'}
+            <span className="spacer" />
+            {analysis && rightTab === 'analysis' && (
               <span className="badge mute">
                 {analysis.analysis_resolution[0]}×{analysis.analysis_resolution[1]} analysis
               </span>
@@ -199,7 +260,9 @@ export function App() {
               busy={job.busy}
               events={job.events}
             />
-            {analysis ? (
+            {hasTrajectory && rightTab === 'results' && job.job && trajectory ? (
+              <ResultsPanel job={job.job} trajectory={trajectory} outputs={job.outputs} cursorTime={cursorTime} />
+            ) : analysis ? (
               <AnalysisPanel
                 analysis={analysis}
                 selectedShot={selectedShot}
@@ -222,11 +285,19 @@ export function App() {
       <div className="bottom">
         <div className="pane-head">
           <div className="tabs">
+            {hasTrajectory && (
+              <button
+                className={`tab ${bottomTab === 'kinematics' ? 'active' : ''}`}
+                onClick={() => setBottomTab('kinematics')}
+              >
+                Camera kinematics
+              </button>
+            )}
             <button
               className={`tab ${bottomTab === 'curves' ? 'active' : ''}`}
               onClick={() => setBottomTab('curves')}
             >
-              Motion curves
+              Image motion
             </button>
             <button
               className={`tab ${bottomTab === 'log' ? 'active' : ''}`}
@@ -263,7 +334,9 @@ export function App() {
         )}
 
         <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex' }}>
-          {bottomTab === 'curves' ? (
+          {bottomTab === 'kinematics' && trajectory ? (
+            <KinematicsCurves trajectory={trajectory} cursorTime={cursorTime} onScrub={scrub} />
+          ) : bottomTab === 'curves' || bottomTab === 'kinematics' ? (
             <MotionCurves
               frames={frames}
               shots={shots}

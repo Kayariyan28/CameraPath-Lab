@@ -185,7 +185,7 @@ export interface Job {
   video: VideoInfo | null
   settings: SolveSettings
   analysis: AnalysisResult | null
-  trajectories: unknown[]
+  trajectories: ShotTrajectory[]
   outputs: JobOutputs
   current_stage: StageProgress | null
   stage_history: StageProgress[]
@@ -267,4 +267,126 @@ export interface HealthInfo {
   can_render: boolean
   can_use_vggt: boolean
   warnings: string[]
+}
+
+// ----------------------------------------------------------------- trajectory
+// Mirrors backend/app/models/schemas/trajectory.py. Positions are camera
+// CENTRES in the CameraPath world (right-handed, Z-up); quaternions are
+// [w, x, y, z] camera-to-world; the camera looks along its local +Y with +Z up.
+
+export type SolverSource =
+  | 'opencv' | 'colmap' | 'vggt' | 'perceptual' | 'motion_proxy_2d' | 'fused' | 'interpolated'
+export type ConfidenceLevel = 'high' | 'medium' | 'low'
+
+export interface CameraPose {
+  frame_index: number
+  timestamp: number
+  position: [number, number, number]
+  quaternion: [number, number, number, number]
+  fov_horizontal: number
+  focal_normalized: number
+  confidence: number
+  solver_source: SolverSource
+  is_anchor: boolean
+}
+
+export interface Kinematics {
+  frame_index: number
+  timestamp: number
+  linear_velocity: [number, number, number]
+  speed: number
+  speed_normalized: number
+  linear_acceleration: [number, number, number]
+  acceleration_magnitude: number
+  jerk_magnitude: number
+  /** Body-frame [yaw, pitch, roll] rates, deg/s. */
+  angular_velocity: [number, number, number]
+  angular_speed: number
+  angular_acceleration: [number, number, number]
+  curvature: number
+}
+
+export interface LensFrame {
+  frame_index: number
+  timestamp: number
+  focal_normalized: number
+  fov_horizontal: number
+  fov_vertical: number
+  confidence: number
+  is_estimated: boolean
+}
+
+export interface ConfidenceReport {
+  level: ConfidenceLevel
+  score: number
+  headline: string
+  reasons: string[]
+  registered_frame_ratio: number
+  persistent_track_count: number
+  mean_inlier_ratio: number
+  mean_reprojection_error: number | null
+  median_reprojection_error: number | null
+  baseline_parallax_score: number
+  bundle_adjustment_residual: number | null
+  solver_agreement: number | null
+  focal_stability: number
+  temporal_consistency: number
+  translation_observable: boolean
+  translation_confidence: number
+  rotation_confidence: number
+  zoom_confidence: number
+}
+
+export interface SolverDecision {
+  solver: SolverSource
+  attempted: boolean
+  succeeded: boolean
+  registered_frames: number
+  total_frames: number
+  duration_seconds: number
+  mean_reprojection_error: number | null
+  confidence: number
+  selected: boolean
+  message: string
+}
+
+export interface ClassifiedMove {
+  label: string
+  strength: number
+  start_time: number
+  end_time: number
+  description: string
+}
+
+export interface ShotTrajectory {
+  shot_id: number
+  frame_count: number
+  duration: number
+  fps: number
+  scale_mode: ScaleMode
+  scale_units: string
+  metric_scale_factor: number | null
+  poses: CameraPose[]
+  kinematics: Kinematics[]
+  lens: LensFrame[]
+  confidence: ConfidenceReport
+  classified_moves: ClassifiedMove[]
+  summary: string
+  solver_decisions: SolverDecision[]
+  pipeline_mode_used: PipelineMode
+  motion_fidelity: MotionFidelity
+  total_path_length: number
+  total_rotation_deg: number
+}
+
+export interface OutputFile {
+  name: string
+  size_bytes: number
+  url: string
+}
+
+export interface OutputsListing {
+  job_id: string
+  outputs: JobOutputs
+  files: OutputFile[]
 }

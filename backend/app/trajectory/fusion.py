@@ -46,11 +46,26 @@ Motion Fidelity scales the selected gain: EXACT applies it in full (the most
 faithful estimate of the source's motion, shake included where the data
 supports it, I10); CLEAN halves it; SMOOTH drops it.
 
-**Translation.** Anchor centres are interpolated with a Hermite spline
-parameterised by the *measured* flow-magnitude profile rather than by time, so
-the velocity profile between two anchors is the measured one (I1). Past the end
-anchors, position continues at the end segments' velocity, decaying like the
-rotation, rather than freezing.
+**Translation.** Anchor centres are interpolated with a non-uniform cubic
+Hermite spline in TIME. A draft parameterised it by the image flow-magnitude
+profile instead, reasoning that flow shows when the camera covered the ground
+between anchors. On a moving camera flow magnitude mostly measures how near the
+scenery is, not how fast the camera goes, and ground truth confirms it:
+
+    per-frame speed error    flow-timed   time-timed
+    orbit                       4.7%        0.1%
+    dolly_forward               5.6%        0.0%
+    accelerating                7.5%        0.0%   (speed-profile corr 0.987 -> 1.000)
+    fpv_curve                   8.4%        0.1%   (corr 0.769 -> 1.000)
+    handheld                   24.7%       26.9%
+
+A held-out-anchor test chose time timing on all eight scenes, handheld included:
+there, every weighting predicted held-out anchors about equally badly, because the
+positional shake is finer than the anchor spacing can represent. Anchor density,
+not timing, is the limit (HIGH_ACCURACY raises keyframe density). Acceleration
+survives because the anchors themselves are timed by container PTS (I1, I2). Past
+the end anchors, position continues at the end segments' velocity, decaying like
+the rotation, rather than freezing.
 
 What this module deliberately does NOT do is turn lateral flow into positional
 shake. The same pixels of image motion are already spent on rotation via the
@@ -808,8 +823,7 @@ def _fuse_against_anchors(
         # apart say nothing about *when* the camera covered the ground between
         # them, but the dense flow profile does (I1). Outside the anchor range
         # Hermite holds the end anchor: flow cannot say how far the camera went.
-        param = speed_warped_parameterization(times, speed)
-        positions = hermite_resample(param[rows], anchor_positions, param)
+        positions = hermite_resample(times[rows], anchor_positions, times)
         positions[rows] = anchor_positions
         _extrapolate_positions(positions, rows, times)
 
