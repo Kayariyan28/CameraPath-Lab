@@ -167,3 +167,20 @@ class TestMisregistrationEvidence:
 
     def test_too_few_peers_flags_nothing(self):
         assert self._flagged([("a", 2000, 0.3), ("b", 100, 2.0)]) == set()
+
+
+def test_a_run_of_consistently_wrong_tail_anchors_is_rejected():
+    """Regression: keyframes 56, 58, 59 of an orbit registered 51 deg off but
+    consistent with each other. No single anchor is a spike; the run must go."""
+    frames = [0, 5, 10, 15, 20, 25, 30, 35, 40]
+    bad = {30: 30 + 45.0, 35: 35 + 45.0, 40: 40 + 45.0}
+    out, rejected = validate_anchor_rotations(_result(frames, bad), _motion(range(1, 41)), FOCAL)
+    assert sorted(r.frame_index for r in rejected) == [30, 35, 40]
+    assert out.frame_indices == [0, 5, 10, 15, 20, 25]
+
+
+def test_a_run_at_the_head_is_rejected_when_the_tail_group_is_larger():
+    frames = [0, 5, 10, 15, 20, 25, 30, 35, 40]
+    bad = {0: -45.0, 5: 5 - 45.0}
+    out, rejected = validate_anchor_rotations(_result(frames, bad), _motion(range(1, 41)), FOCAL)
+    assert sorted(r.frame_index for r in rejected) == [0, 5]

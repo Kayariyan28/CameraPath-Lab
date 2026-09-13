@@ -165,3 +165,20 @@ def _detect(clips_dir, name):
     info = probe_video(clips_dir / name)
     frames, info = probe_frames(info)
     return detect_shots(info, frames)
+
+
+def test_cut_between_two_moves_in_the_same_3d_location():
+    """Regression (I4): with parallax on both sides, motion compensation leaves every
+    frame poorly aligned, so the cut was no residual spike and one trajectory spanned
+    the edit. Built by scripts from two synthetic renders of the same scene."""
+    from pathlib import Path
+    from app.video.ffprobe import probe_frames, probe_video
+    clip = Path(__file__).resolve().parents[2] / "benchmarks" / "synthetic" / "hard_cut_orbit_pan.mp4"
+    if not clip.is_file():
+        import pytest
+        pytest.skip("synthetic hard cut not built")
+    info = probe_video(clip)
+    frames, info = probe_frames(info)
+    shots, candidates = detect_shots(info, frames)
+    assert [(s.start_frame, s.end_frame) for s in shots] == [(0, 59), (60, 119)]
+    assert any(c.accepted and "tracking died" in c.reason for c in candidates)

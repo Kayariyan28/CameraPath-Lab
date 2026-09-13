@@ -113,6 +113,27 @@ class CutThresholds:
     """How many frames either side form the comparison neighbourhood. Narrow on
     purpose: it must not reach into a different motion regime."""
 
+    # --- second path: isolated tracking break (3D footage) --------------------
+    break_max_survival: float = 0.05
+    """Tracking must die completely at the transition..."""
+    break_max_coherence: float = 0.10
+    break_min_neighbour_survival: float = 0.30
+    """...while the frames either side still track within their own shots..."""
+    break_min_hist_ratio: float = 1.6
+    """...and the appearance must jump relative to its neighbours.
+
+    Why this path exists: the compensation residual assumes ordinary frames align
+    well under one similarity transform. With real depth they do not — parallax
+    leaves a residual on every frame — so a cut between an orbit and a pan of the
+    same synthetic location scored 0.0338 residual, exactly its orbit neighbours'
+    0.026-0.035, and was missed: one trajectory spanned the edit (I4). Measured on
+    every clip: real cuts had neighbour survival 0.38-0.91 with histogram jumps of
+    2.0-4.3x; whip-pan frames with dead tracking had neighbours at 0.00-0.24, or
+    0.48 with no jump (1.0x); a fly-through's 2.0x frame sat inside a run of dead
+    tracking (neighbours 0.00). Each threshold sits inside its measured gap.
+    Known gap: a same-location cut with almost no histogram change AND parallax on
+    both sides remains undetectable by either path."""
+
 
 def _grid_histogram(frame: np.ndarray) -> np.ndarray:
     """Concatenated per-cell intensity histograms, L1-normalised per cell."""
@@ -294,7 +315,29 @@ def detect_shots(
 
         accepted = substantial and isolated and broken
 
-        if accepted:
+        # Second path (see CutThresholds.break_*): isolated total tracking death
+        # with an appearance jump, for footage whose parallax defeats compensation.
+        lo, hi = max(1, i - th.neighbour_span), min(n, i + th.neighbour_span + 1)
+        neighbour_survival = [cues[k].survival for k in range(lo, hi) if k != i]
+        hist_values = np.array([cues[k].hist_change for k in range(lo, hi) if k != i])
+        hist_ratio = c.hist_change / (float(hist_values.max()) + 1e-5) if hist_values.size else 0.0
+        tracking_break = (
+            c.survival <= th.break_max_survival
+            and c.coherence <= th.break_max_coherence
+            and bool(neighbour_survival)
+            and min(neighbour_survival) >= th.break_min_neighbour_survival
+            and hist_ratio >= th.break_min_hist_ratio
+        )
+        via_break = tracking_break and not accepted
+        accepted = accepted or tracking_break
+
+        if via_break:
+            reason = (
+                f"tracking died completely ({c.survival:.0%} survival) while the frames "
+                f"either side tracked normally (at least {min(neighbour_survival):.0%}), and "
+                f"the appearance jumped {hist_ratio:.1f}x — an edit, not camera motion"
+            )
+        elif accepted:
             reason = (
                 f"no transform explains this transition: {c.residual * 100:.1f}% "
                 f"residual after motion compensation ({ratio:.0f}x its neighbours), "
@@ -321,7 +364,7 @@ def detect_shots(
         else:
             reason = "motion fully explained by a single transform"
 
-        if accepted or substantial or isolated:
+        if accepted or substantial or isolated or tracking_break:
             candidates.append(
                 CutCandidate(
                     frame_index=i,

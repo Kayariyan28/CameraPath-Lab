@@ -26,10 +26,10 @@ motion floods the image with translational flow, the two bad anchors fitted unde
 it — and the search dropped a GOOD anchor, because skipping it made the chain
 longer. An anchor is now rejected only as a spike: inconsistent with its
 neighbour(s) while those neighbours are consistent with each other without it.
-Under that rule a good anchor cannot be sacrificed to make room for bad ones; the
-cost is that a run of several consecutive bad anchors is not caught here, which is
-why this check backs up, rather than replaces, the solver's own registration
-evidence (see colmap_solver.MISREGISTERED_*).
+Under that rule a good anchor cannot be sacrificed to make room for bad ones. A
+second pass then handles RUNS of bad anchors, which the spike rule cannot see: it
+splits the survivors wherever consecutive anchors disagree and keeps the largest
+group. It still only compares consecutive anchors, so it cannot bridge a good one.
 """
 
 from __future__ import annotations
@@ -127,6 +127,9 @@ def validate_anchor_rotations(
         running += per_step.get(f, float("inf"))
         prefix[f] = running
 
+    def times_span(group: list[int]) -> int:
+        return frames[group[-1]] - frames[group[0]]
+
     def check(i: int, j: int) -> tuple[bool, float, float]:
         a, b = min(i, j), max(i, j)
         claimed = float(np.degrees(quat_angular_distance(quats[a], quats[b])))
@@ -155,6 +158,33 @@ def validate_anchor_rotations(
             if not ok_prev and not ok_next and check(k - 1, k + 1)[0]:
                 drop.add(k)
                 rejected.append(RejectedAnchor(frames[k], claimed, limit, frames[k - 1]))
+
+    # --- runs: split at consecutive inconsistencies, keep the largest group --
+    # The spike rule cannot see a RUN of bad anchors: on a re-run of the orbit,
+    # keyframes 56, 58 and 59 all registered 51 deg off but consistently with each
+    # other, so no single anchor looked like a spike and the confident solve was
+    # 27.8% wrong. Only CONSECUTIVE surviving anchors are compared here, so a good
+    # anchor can never be bridged over the way the discarded longest-chain search
+    # did; a break splits the anchors into groups and all but the largest
+    # (by time span) are rejected.
+    survivors = [k for k in range(n) if k not in drop]
+    if len(survivors) >= 3:
+        groups: list[list[int]] = [[survivors[0]]]
+        for a, b in zip(survivors, survivors[1:]):
+            if check(a, b)[0]:
+                groups[-1].append(b)
+            else:
+                groups.append([b])
+        if len(groups) > 1:
+            main = max(groups, key=lambda g: (times_span(g), len(g)))
+            for g in groups:
+                if g is main:
+                    continue
+                for k in g:
+                    nearest = min(main, key=lambda m: abs(frames[m] - frames[k]))
+                    _, claimed, limit = check(nearest, k)
+                    drop.add(k)
+                    rejected.append(RejectedAnchor(frames[k], claimed, limit, frames[nearest]))
 
     if not drop:
         return result, []

@@ -46,6 +46,7 @@ from app.solvers.colmap_solver import PyColmapBackend
 from app.solvers.opencv_solver import OpenCVPoseBackend
 from app.solvers.perceptual_solver import PerceptualMatchBackend
 from app.tracking.keyframe_geometry import KeyframeHomography
+from app.trajectory.classify import classify_motion
 from app.trajectory.exporters import TRAJECTORY_STEM, export_all, shot_stem
 from app.trajectory.fusion import fuse_lens_curve, fuse_trajectory
 from app.trajectory.kinematics import compute_kinematics, path_length, total_rotation_degrees
@@ -288,6 +289,13 @@ class SolvePipeline:
                 reporter.info(f"shot {shot.id}: metric scale — {statement}")
 
         kinematics = compute_kinematics(poses, scale_mode)
+        # Post-hoc description only; nothing below feeds back into the solve.
+        moves, move_summary = classify_motion(
+            poses, kinematics, fused_lens,
+            jitter_score=inputs.signature.jitter_score,
+            translation_observable=geometry.translation_observable,
+            units=units,
+        )
 
         self._set_stage(job_id, reporter, Stage.VALIDATING_TRAJECTORY, f"shot {shot.id + 1}")
         confidence = self._confidence(
@@ -306,8 +314,8 @@ class SolvePipeline:
             kinematics=kinematics,
             lens=fused_lens,
             confidence=confidence,
-            classified_moves=[],
-            summary=self._summary(poses, geometry, mode_used, fused_lens_note, units),
+            classified_moves=moves,
+            summary=f"{move_summary} {self._summary(poses, geometry, mode_used, fused_lens_note, units)}",
             solver_decisions=decisions,
             pipeline_mode_used=mode_used,
             motion_fidelity=settings.motion_fidelity,
