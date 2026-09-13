@@ -29,6 +29,7 @@ from app.core.logging import get_logger
 from app.geometry.conventions import cv_rotation_to_camerapath
 from app.geometry.rotations import matrix_to_quat
 from app.models.schemas.trajectory import SolverSource
+from app.solvers.anchor_validation import validate_anchor_rotations
 from app.solvers.base import GeometryResult, SolveContext, failed_result, select_keyframes
 from app.video.decoder import materialize_frames
 
@@ -60,6 +61,17 @@ FOCAL_PROBE_STEP = 0.15
 #: adjustment's own "refined" focal is not evidence — on the unobservable shots it
 #: simply drifted from whatever prior it was given.
 FOCAL_OBSERVABLE_MIN_RISE = 0.03
+
+#: A registered image is treated as mis-registered when it shows BOTH far fewer
+#: triangulated observations than its peers AND a much higher reprojection error.
+#: Measured on synthetic ground truth: two keyframes COLMAP placed 48-55 deg wrong
+#: (camera grazing a wall) had 0.16-0.23x the median observation count and
+#: 2.1-2.4x the median error. Correct keyframes reached at most 1.14x error; the
+#: first frame of a dolly had 0.26x observations (everything is distant) at a
+#: normal 0.99x error, which is why both conditions are required. PROVISIONAL:
+#: calibrated on three scenes; revisit as the synthetic suite grows.
+MISREGISTERED_MAX_POINTS_RATIO = 0.5
+MISREGISTERED_MIN_ERROR_RATIO = 1.7
 
 #: Confidence attached to a focal that is only the prior. Low but not zero: the
 #: prior is a stated assumption (see geometry/intrinsics.py), not noise.
@@ -247,10 +259,35 @@ class PyColmapBackend:
             reconstruction, context, db_path=db_path, image_dir=image_dir, work=work
         )
 
-        return self._read_poses(
+        result = self._read_poses(
             reconstruction, name_to_index, context, fragmented=fragmented,
             model_count=len(reconstructions), focal=focal,
         )
+        if not result.succeeded:
+            return result
+
+        # A reconstruction can hold a confidently wrong registration with
+        # sub-pixel error; the dense flow is independent evidence against it.
+        # The bound needs focal in ANALYSIS pixels, and the smaller candidate is
+        # used so that uncertainty widens the bound instead of causing rejections.
+        analysis_w, analysis_h = context.analysis_size
+        candidates = [float(context.intrinsics.scaled_to(analysis_w, analysis_h).fx)]
+        if result.focal_pixels and result.focal_image_width:
+            candidates.append(result.focal_pixels * analysis_w / result.focal_image_width)
+        validated, rejected = validate_anchor_rotations(
+            result, context.motion_frames, min(candidates)
+        )
+        if rejected:
+            context.report(
+                f"COLMAP: rejected {len(rejected)} anchor(s) inconsistent with the image motion"
+            )
+            if not validated.succeeded:
+                return failed_result(
+                    self.source,
+                    f"too few anchors survived flow-consistency checks: {validated.message}",
+                    total,
+                )
+        return validated
 
     def _resolve_focal(
         self, reconstruction, context: SolveContext, *,
@@ -353,13 +390,14 @@ class PyColmapBackend:
 
         entries: list[tuple[int, np.ndarray, np.ndarray]] = []
         convention_errors: list[float] = []
+        misregistered = self._misregistered_images(reconstruction)
 
         for image_id in reconstruction.reg_image_ids():
             image = reconstruction.image(image_id)
             if not _value(image, "has_pose"):
                 continue
             frame_index = name_to_index.get(image.name)
-            if frame_index is None:
+            if frame_index is None or image.name in misregistered:
                 continue
 
             # world -> camera, in OpenCV axis convention.
@@ -399,6 +437,10 @@ class PyColmapBackend:
                     f"{worst:.3e}) — refusing to emit a possibly mirrored trajectory",
                     total,
                 )
+
+        if misregistered:
+            log.warning("discarding %d likely mis-registered image(s): %s",
+                        len(misregistered), ", ".join(sorted(misregistered)))
 
         entries.sort(key=lambda e: e[0])
         frame_indices = [e[0] for e in entries]
@@ -469,6 +511,11 @@ class PyColmapBackend:
         if mean_track:
             notes.append(f"mean track length {mean_track:.1f}")
         notes.append(focal["note"])
+        if misregistered:
+            notes.append(
+                f"discarded {len(misregistered)} keyframe(s) with few observations and high "
+                "reprojection error relative to their peers (likely mis-registered)"
+            )
         if fragmented:
             notes.append(
                 f"reconstruction fragmented into {model_count} models — using the largest"
@@ -503,6 +550,31 @@ class PyColmapBackend:
         )
         log.info("COLMAP result: %s (confidence %.2f)", result.message, confidence)
         return result
+
+    @staticmethod
+    def _misregistered_images(reconstruction) -> set[str]:
+        """Names of registered images whose registration evidence is far weaker
+        than their peers' on BOTH counts. See MISREGISTERED_* for calibration."""
+        stats: list[tuple[str, int, float]] = []
+        for image_id in reconstruction.reg_image_ids():
+            image = reconstruction.image(image_id)
+            errors = [
+                float(reconstruction.points3D[p.point3D_id].error)
+                for p in image.points2D if p.has_point3D()
+            ]
+            if errors:
+                stats.append((image.name, len(errors), float(np.mean(errors))))
+        if len(stats) < 5:
+            return set()  # too few peers for a median to mean anything
+        median_points = float(np.median([n for _, n, _ in stats]))
+        median_error = float(np.median([e for _, _, e in stats]))
+        if median_points <= 0 or median_error <= 0:
+            return set()
+        return {
+            name for name, n, e in stats
+            if n / median_points < MISREGISTERED_MAX_POINTS_RATIO
+            and e / median_error > MISREGISTERED_MIN_ERROR_RATIO
+        }
 
     @staticmethod
     def _score(

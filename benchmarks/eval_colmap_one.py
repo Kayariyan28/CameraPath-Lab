@@ -82,7 +82,7 @@ print(f"  vs truth ({err.sample_count} poses, align={err.alignment_method}): rot
       f"{err.rotation_mae_degrees:.3f} deg, median {rot_median:.3f}, "
       f"max {err.rotation_max_degrees:.3f}, shape err {err.normalized_shape_error*100:.2f}%, "
       f"path ratio {err.path_length_ratio:.3f}  => {'PASS' if passed else 'FAIL'}")
-print(json.dumps({"scene": scene, "fov_err": fov_err, "focal_observable": res.focal_observable,
+print(json.dumps({"scene": scene, "work_dir": str(ctx.work_dir), "fov_err": fov_err, "focal_observable": res.focal_observable,
                   "rot_median": rot_median, "rot_mae": err.rotation_mae_degrees,
                   "shape_err": err.normalized_shape_error, "registered": res.registered_frames,
                   "passed": passed}))
