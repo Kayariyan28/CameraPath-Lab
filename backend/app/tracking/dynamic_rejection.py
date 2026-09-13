@@ -35,6 +35,7 @@ import numpy as np
 
 from app.core.logging import get_logger
 from app.tracking.flow import FlowResult, Track
+from app.tracking.robust import robust
 
 log = get_logger("tracking.dynamic")
 
@@ -125,7 +126,7 @@ class GeometricDynamicRejector:
         """
         if len(src) < 6:
             return None
-        model, _ = cv2.estimateAffinePartial2D(
+        model, _ = robust(cv2.estimateAffinePartial2D, 
             src, dst, method=cv2.RANSAC,
             ransacReprojThreshold=RANSAC_THRESHOLD_FIT,
             maxIters=2500, confidence=0.995, refineIters=20,
@@ -192,7 +193,7 @@ class GeometricDynamicRejector:
         motion = float(np.median(np.linalg.norm(dst - src, axis=1)))
 
         # Homography: right model for rotation-only, zoom, and planar scenes.
-        h, _ = cv2.findHomography(
+        h, _ = robust(cv2.findHomography, 
             src, dst, method=cv2.USAC_MAGSAC,
             ransacReprojThreshold=RANSAC_THRESHOLD_FIT, maxIters=3000, confidence=0.995,
         )
@@ -210,7 +211,7 @@ class GeometricDynamicRejector:
         # Needs measured parallax (see the docstring) and enough motion to be
         # numerically conditioned at all.
         if use_epipolar and len(src) >= 50 and motion > 1.5:
-            f, _ = cv2.findFundamentalMat(
+            f, _ = robust(cv2.findFundamentalMat, 
                 src, dst, method=cv2.USAC_MAGSAC,
                 ransacReprojThreshold=1.5, confidence=0.995, maxIters=4000,
             )

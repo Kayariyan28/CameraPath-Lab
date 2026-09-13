@@ -160,78 +160,169 @@ def initial_intrinsics(
     )
 
 
+#: A chain of consecutive homographies is closed once it spans this many frames.
+#: Per-frame rotation is often ~1 deg, too small to constrain focal; chaining
+#: builds a baseline of 10+ deg while keeping accumulated error small.
+FOCAL_CHAIN_MAX_FRAMES = 20
+FOCAL_CHAIN_MIN_FRAMES = 3
+FOCAL_CHAIN_MIN_INLIERS = 0.6
+
+#: Structure cost at +-15% focal must exceed the cost at the optimum by this
+#: factor for focal to count as measured. Calibrated on synthetic ground truth:
+#: pan 10929 and tilt 3070 (both recovered to within 0.03 deg); roll, zoom-only
+#: and static 1.00-1.01, which is the correct answer — K commutes with a roll
+#: about the optical axis and with a zoom, so neither reveals focal length.
+FOCAL_SHARPNESS_THRESHOLD = 10.0
+
+
+def _homography_chains(motion_frames: list[MotionFrame]) -> list[np.ndarray]:
+    chains: list[np.ndarray] = []
+    current, length = np.eye(3), 0
+    for mf in motion_frames:
+        usable = (
+            mf.homography is not None and len(mf.homography) == 9
+            and mf.inlier_ratio >= FOCAL_CHAIN_MIN_INLIERS
+        )
+        h = np.asarray(mf.homography, dtype=np.float64).reshape(3, 3) if usable else None
+        if h is None or not np.isfinite(h).all():
+            if length >= FOCAL_CHAIN_MIN_FRAMES:
+                chains.append(current)
+            current, length = np.eye(3), 0
+            continue
+        current = h @ current
+        length += 1
+        if length >= FOCAL_CHAIN_MAX_FRAMES:
+            chains.append(current)
+            current, length = np.eye(3), 0
+    if length >= FOCAL_CHAIN_MIN_FRAMES:
+        chains.append(current)
+    return chains
+
+
+def _rotation_structure_cost(chains: list[np.ndarray], focal: float, width: int, height: int) -> float:
+    """How far K^-1 H K is from (zoom) x (rotation), averaged over chains.
+
+    A camera that rotates and zooms about the principal point gives
+    M = K^-1 H K = diag(s,s,1) R, so M M^T = diag(s^2, s^2, 1) up to scale:
+    zero off-diagonals and equal leading entries. That form holds at the true
+    focal whatever the zoom, so a zoom cannot bias the estimate.
+    """
+    k = np.array([[focal, 0.0, width / 2.0], [0.0, focal, height / 2.0], [0.0, 0.0, 1.0]])
+    k_inv = np.linalg.inv(k)
+    total = 0.0
+    for h in chains:
+        m = k_inv @ h @ k
+        sym = m @ m.T
+        trace = float(np.trace(sym))
+        if trace <= 1e-12 or not np.isfinite(trace):
+            continue
+        sym = sym / (trace / 3.0)
+        total += 2.0 * (sym[0, 1] ** 2 + sym[0, 2] ** 2 + sym[1, 2] ** 2) + (sym[0, 0] - sym[1, 1]) ** 2
+    return total / max(len(chains), 1)
+
+
 def estimate_focal_from_homographies(
     motion_frames: list[MotionFrame], width: int, height: int
 ) -> tuple[float | None, float]:
-    """Estimate focal length from inter-frame homographies of a rotating camera.
+    """Focal length from the homographies of a camera that rotates (and zooms).
 
-    For a camera that only rotates, consecutive views are related by
-    `H ~ K R K^-1`. That constrains K, and with a centred principal point and
-    square pixels it leaves one unknown — the focal length.
+    Returns (focal_pixels, confidence) at the resolution the homographies were
+    measured at, or (None, 0.0) when the shot does not constrain focal.
 
-    Returns (focal_pixels, confidence). None when the shot does not contain
-    enough rotation to constrain anything: a pure translation gives a homography
-    that is consistent with *any* focal length, so producing a number there
-    would be fabrication.
+    Method: chain consecutive homographies into baselines of up to
+    FOCAL_CHAIN_MAX_FRAMES, then find the focal that makes every chain look like
+    a zoom times a rotation (`_rotation_structure_cost`), by grid search over the
+    plausible FOV range and golden-section refinement. Observability is then
+    TESTED, not assumed: the cost must rise sharply either side of the optimum.
+
+    This replaced per-frame closed-form constraints that divided by products of
+    tiny perspective terms. On a synthetic pan they returned 59.9 deg at
+    confidence 0.63 against a true 65.5 deg; this method returns 65.50.
+
+    Returns None — never a number — for pure roll, pure zoom and static shots,
+    where focal is genuinely unobservable, and for shots whose translation makes
+    the homography model itself invalid (use the geometric solve's focal there).
     """
-    candidates: list[float] = []
-
-    for mf in motion_frames:
-        if mf.homography is None or mf.inlier_ratio < 0.7:
-            continue
-        # Needs real rotation to be informative.
-        if abs(mf.rotation_deg) < 0.05 and abs(mf.dx_pixels) < 1.0 and abs(mf.dy_pixels) < 1.0:
-            continue
-
-        h = np.array(mf.homography, dtype=np.float64).reshape(3, 3)
-        if not np.isfinite(h).all() or abs(h[2, 2]) < 1e-12:
-            continue
-        h = h / h[2, 2]
-
-        # Shift to a principal-point-centred frame so K = diag(f, f, 1).
-        cx, cy = width / 2.0, height / 2.0
-        t = np.array([[1.0, 0.0, -cx], [0.0, 1.0, -cy], [0.0, 0.0, 1.0]])
-        hc = t @ h @ np.linalg.inv(t)
-
-        # With K = diag(f,f,1), H = K R K^-1 implies these two constraints on
-        # f^2 (from orthonormality of R's first two columns).
-        # R = K^-1 H K, and R^T R = I gives:
-        #   f^2 = -(h00*h01 + h10*h11) / (h20*h21)     [column orthogonality]
-        denom = hc[2, 0] * hc[2, 1]
-        if abs(denom) > 1e-14:
-            f_sq = -(hc[0, 0] * hc[0, 1] + hc[1, 0] * hc[1, 1]) / denom
-            if np.isfinite(f_sq) and f_sq > 0:
-                candidates.append(float(np.sqrt(f_sq)))
-
-        # Second constraint from equal column norms.
-        denom2 = hc[2, 0] ** 2 - hc[2, 1] ** 2
-        if abs(denom2) > 1e-14:
-            num2 = (hc[0, 1] ** 2 + hc[1, 1] ** 2) - (hc[0, 0] ** 2 + hc[1, 0] ** 2)
-            f_sq = num2 / denom2
-            if np.isfinite(f_sq) and f_sq > 0:
-                candidates.append(float(np.sqrt(f_sq)))
-
-    if len(candidates) < 8:
+    chains = _homography_chains(motion_frames)
+    if len(chains) < 2 or width <= 0 or height <= 0:
         return None, 0.0
 
-    arr = np.array(candidates)
-    # Keep physically plausible values only.
-    lo = fov_to_focal_pixels(MAX_HORIZONTAL_FOV, width)
-    hi = fov_to_focal_pixels(MIN_HORIZONTAL_FOV, width)
-    arr = arr[(arr > lo) & (arr < hi)]
-    if len(arr) < 8:
+    fovs = np.arange(MIN_HORIZONTAL_FOV, MAX_HORIZONTAL_FOV + 1e-9, 0.5)
+    focals = np.array([fov_to_focal_pixels(float(f), width) for f in fovs])
+    costs = np.array([_rotation_structure_cost(chains, float(f), width, height) for f in focals])
+    if not np.isfinite(costs).any():
+        return None, 0.0
+    i = int(np.nanargmin(costs))
+
+    # Golden-section refinement between the neighbouring grid points.
+    lo = focals[min(i + 1, len(focals) - 1)]  # focals decrease as FOV increases
+    hi = focals[max(i - 1, 0)]
+    golden = (np.sqrt(5.0) - 1.0) / 2.0
+    a, b = min(lo, hi), max(lo, hi)
+    for _ in range(40):
+        c = b - golden * (b - a)
+        d = a + golden * (b - a)
+        if _rotation_structure_cost(chains, c, width, height) < _rotation_structure_cost(chains, d, width, height):
+            b = d
+        else:
+            a = c
+    focal = 0.5 * (a + b)
+    best = _rotation_structure_cost(chains, focal, width, height)
+
+    sharpness = min(
+        _rotation_structure_cost(chains, focal * 0.85, width, height),
+        _rotation_structure_cost(chains, focal * 1.15, width, height),
+    ) / (best + 1e-12)
+    if not np.isfinite(sharpness) or sharpness < FOCAL_SHARPNESS_THRESHOLD:
+        log.info("focal not observable from homographies (sharpness %.2f over %d chains)",
+                 sharpness, len(chains))
         return None, 0.0
 
-    focal = float(np.median(arr))
-    # Confidence from agreement: a wide spread means the constraints disagree,
-    # which happens when the motion is not actually rotation-dominated.
-    spread = float(np.median(np.abs(arr - focal)) / max(focal, 1e-6))
-    confidence = float(np.clip(1.0 - spread * 4.0, 0.0, 0.75)) * min(1.0, len(arr) / 40.0)
-    log.info(
-        "focal from %d homography constraints: %.1f px (spread %.1f%%, confidence %.2f)",
-        len(arr), focal, spread * 100, confidence,
-    )
-    return focal, confidence
+    confidence = float(np.clip(0.5 + 0.1 * np.log10(sharpness), 0.5, 0.9))
+    log.info("focal from %d homography chains: %.1f px = %.2f deg (sharpness %.0f, confidence %.2f)",
+             len(chains), focal, focal_pixels_to_fov(focal, width), sharpness, confidence)
+    return float(focal), confidence
+
+
+def zoom_factor_from_homography(homography: list[float] | None, base: CameraIntrinsics) -> float:
+    """Per-transition zoom factor from a frame-to-frame homography; 1.0 if none.
+
+    Why not the similarity `scale`: fitting a similarity to the perspective flow
+    of a panning wide lens produces a large, steady, entirely spurious scale.
+    Measured on a synthetic pure pan with a 65 deg lens: 1.0196 per frame — the
+    same as a genuine 1.9%-per-frame zoom (1.0191). Accumulated over 59 frames it
+    reported a 212% zoom and shrank the FOV from 60 to 21 deg.
+
+    The intrinsics-normalised homography separates them. A camera that only
+    rotates and zooms about the principal point has H = K diag(s,s,1) R K^-1, so
+    K^-1 H K = diag(s,s,1) R, whose singular values are (s, s, 1) up to the
+    homography's arbitrary scale — R contributes nothing. Pure rotation gives
+    three equal values; a zoom scales two of them. Measured: pan [1.0001, 1.0001,
+    1], zoom [1.0192, 1.0191, 1]. For a zoom the recovered factor does not even
+    depend on the assumed focal, because diag(s,s,1) commutes with diag(f,f,1).
+
+    The two closest singular values are the zoomed pair and the third is the
+    unscaled axis, which handles zoom-out (pair below the odd one) as well as
+    zoom-in.
+    """
+    if homography is None or len(homography) != 9:
+        return 1.0
+    h = np.asarray(homography, dtype=np.float64).reshape(3, 3)
+    if not np.isfinite(h).all():
+        return 1.0
+    k = np.array([[base.fx, 0.0, base.cx], [0.0, base.fy, base.cy], [0.0, 0.0, 1.0]])
+    try:
+        normalised = np.linalg.inv(k) @ h @ k
+        sv = np.linalg.svd(normalised, compute_uv=False)
+    except np.linalg.LinAlgError:
+        return 1.0
+    if sv[-1] <= 1e-12:
+        return 1.0
+    if abs(sv[0] - sv[1]) <= abs(sv[1] - sv[2]):
+        factor = float(np.sqrt(sv[0] * sv[1]) / sv[2])
+    else:
+        factor = float(np.sqrt(sv[1] * sv[2]) / sv[0])
+    return factor if np.isfinite(factor) and factor > 0 else 1.0
 
 
 def build_lens_curve(
@@ -244,8 +335,10 @@ def build_lens_curve(
 ) -> tuple[list[LensFrame], str]:
     """Per-frame focal/FOV curve.
 
-    Zoom is detected from the accumulated image scale factor. The critical
-    caveat is baked in: expanding radial flow is produced by a dolly-in AND by a
+    Zoom is detected from the accumulated zoom factor of the intrinsics-normalised
+    frame-to-frame homographies (see `zoom_factor_from_homography` for why not
+    the similarity scale). `base` must be at the analysis resolution the
+    homographies were measured at. The critical caveat is baked in: expanding radial flow is produced by a dolly-in AND by a
     zoom-in, and they are only separable by parallax. So:
 
       * `lens_mode="fixed"`   — trust the user, emit a flat curve
@@ -259,8 +352,22 @@ def build_lens_curve(
     if not motion_frames:
         return [], "no frames to estimate a lens curve from"
 
+    focal_note = ""
+    # A rotating camera reveals its focal length; that measurement beats a prior.
+    # Only below the parallax gate, where the homography model is valid, and
+    # never over a user override.
+    if base.source != "user_override" and parallax_score < 0.15:
+        measured, measured_conf = estimate_focal_from_homographies(motion_frames, base.width, base.height)
+        if measured is not None:
+            fov = focal_pixels_to_fov(measured, base.width)
+            base = intrinsics_from_fov(base.width, base.height, fov, source="estimated",
+                                       confidence=measured_conf)
+            focal_note = f"focal measured from camera rotation ({fov:.1f} deg horizontal); "
+
     long_edge = max(base.width, base.height)
-    cumulative = np.cumprod([max(mf.scale, 1e-3) for mf in motion_frames])
+    cumulative = np.cumprod([
+        max(zoom_factor_from_homography(mf.homography, base), 1e-3) for mf in motion_frames
+    ])
     net_change = float(cumulative[-1])
 
     # A real zoom moves the scale by more than tracking noise can explain.
@@ -339,7 +446,7 @@ def build_lens_curve(
                 is_estimated=True,
             )
         )
-    return curve, note
+    return curve, focal_note + note
 
 
 def _smooth_preserving_trend(series: np.ndarray, window: int) -> np.ndarray:

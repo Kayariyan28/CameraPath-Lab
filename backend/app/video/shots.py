@@ -64,6 +64,7 @@ from app.models.schemas.video import (
     VideoInfo,
 )
 from app.video.decoder import FrameDecoder
+from app.tracking.robust import robust
 
 log = get_logger("video.shots")
 
@@ -172,7 +173,7 @@ def _measure_transition(prev: np.ndarray, cur: np.ndarray,
             if ok.sum() >= 8:
                 src = corners[ok].reshape(-1, 2)
                 dst = nxt[ok].reshape(-1, 2)
-                model, inliers = cv2.estimateAffinePartial2D(
+                model, inliers = robust(cv2.estimateAffinePartial2D, 
                     src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0,
                     maxIters=2000, confidence=0.99,
                 )

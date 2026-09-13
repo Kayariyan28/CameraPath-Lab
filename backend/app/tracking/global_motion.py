@@ -26,6 +26,7 @@ import numpy as np
 from app.core.logging import get_logger
 from app.models.schemas.motion import MotionFrame, MotionModel, MotionSignature
 from app.tracking.flow import FlowResult
+from app.tracking.robust import robust
 
 log = get_logger("tracking.global_motion")
 
@@ -35,6 +36,10 @@ RANSAC_THRESHOLD = 2.2
 #: Below this median flow, motion is at or under the noise floor of sub-pixel
 #: corner localisation and nothing about it should be trusted.
 STATIC_FLOW_FLOOR = 0.35
+
+#: A homography within this inlier ratio of the selected simpler model is used to
+#: read dx/dy/rotation/scale (see estimate_transition).
+HOMOGRAPHY_DECOMPOSITION_TOLERANCE = 0.05
 
 #: A homography this good means no measurable parallax.
 HOMOGRAPHY_EXPLAINS_ALL_INLIERS = 0.93
@@ -61,6 +66,38 @@ def _decompose_similarity(matrix: np.ndarray, centre: tuple[float, float]
     rotation = float(np.degrees(np.arctan2(a[1, 0] - a[0, 1], a[0, 0] + a[1, 1])))
     scale = float(np.sqrt(max(abs(np.linalg.det(a)), 1e-12)))
     return dx, dy, rotation, scale
+
+
+def _local_affine_of_homography(h: np.ndarray, centre: tuple[float, float]) -> np.ndarray:
+    """2x3 affine that agrees with homography `h` at the image centre: same
+    image of the centre, and the same Jacobian there.
+
+    Taking hom[:2, :3] instead — dropping the perspective row — is only valid for
+    a homography that is already nearly affine, which is exactly what a panning
+    or tilting wide lens is not. On a synthetic 1.15 deg/frame pan with a 65 deg
+    lens it reported dx -10.0 px, dy +4.0 px and 0.21 deg of roll, where the true
+    image motion is about -17 px of dx and neither of the others; the same error
+    produced a steady, spurious 2% per-frame "scale" that read as a zoom. The
+    synthetic 2D test clips never exposed it because their homographies are
+    affine to begin with.
+
+    For x' = (a.p)/(c.p), y' = (b.p)/(c.p), the Jacobian at p is
+    d(x',y')/d(x,y) = ([a0 a1; b0 b1] - [x'; y'] [c0 c1]) / (c.p).
+    """
+    cx, cy = centre
+    p = np.array([cx, cy, 1.0])
+    w = float(h[2] @ p)
+    if abs(w) < 1e-12 or not np.isfinite(w):
+        return np.asarray(h[:2, :3], dtype=np.float64)
+    mapped = (h[:2] @ p) / w
+    jacobian = (h[:2, :2] - np.outer(mapped, h[2, :2])) / w
+    translation = mapped - jacobian @ np.array([cx, cy])
+    return np.hstack([jacobian, translation.reshape(2, 1)])
+
+
+# Public names: the Perceptual Match predictor must compute the signature with
+# exactly the same definitions as the measurement, or it fits a bias.
+local_affine_of_homography = _local_affine_of_homography
 
 
 def _first_order_flow_field(points: np.ndarray, flow: np.ndarray,
@@ -178,7 +215,7 @@ def estimate_transition(
     mf.median_flow = [float(np.median(flow[:, 0])), float(np.median(flow[:, 1]))]
 
     # ---- dominant similarity model (4 DoF) — the most stable choice ----
-    sim, sim_inliers = cv2.estimateAffinePartial2D(
+    sim, sim_inliers = robust(cv2.estimateAffinePartial2D, 
         src, dst, method=cv2.RANSAC,
         ransacReprojThreshold=RANSAC_THRESHOLD,
         maxIters=3000, confidence=0.995, refineIters=24,
@@ -186,7 +223,7 @@ def estimate_transition(
     sim_ratio = float(sim_inliers.ravel().mean()) if sim_inliers is not None else 0.0
 
     # ---- full affine (6 DoF) ----
-    aff, aff_inliers = cv2.estimateAffine2D(
+    aff, aff_inliers = robust(cv2.estimateAffine2D, 
         src, dst, method=cv2.RANSAC,
         ransacReprojThreshold=RANSAC_THRESHOLD,
         maxIters=3000, confidence=0.995, refineIters=24,
@@ -196,7 +233,7 @@ def estimate_transition(
     # ---- homography (8 DoF) — needs more points to be meaningful ----
     hom, hom_inliers, hom_ratio, hom_residual = None, None, 0.0, float("inf")
     if len(src) >= 14:
-        hom, hom_inliers = cv2.findHomography(
+        hom, hom_inliers = robust(cv2.findHomography, 
             src, dst, method=cv2.USAC_MAGSAC,
             ransacReprojThreshold=RANSAC_THRESHOLD,
             maxIters=4000, confidence=0.995,
@@ -217,9 +254,16 @@ def estimate_transition(
         chosen_matrix, chosen_inliers, chosen_ratio, model = aff, aff_inliers, aff_ratio, MotionModel.AFFINE
     if hom is not None and hom_ratio > chosen_ratio + 0.06:
         chosen_inliers, chosen_ratio, model = hom_inliers, hom_ratio, MotionModel.HOMOGRAPHY
-        # Keep an affine view of the homography for dx/dy/rot/scale reporting;
-        # the perspective terms are preserved separately in `homography`.
-        chosen_matrix = np.asarray(hom[:2, :3], dtype=np.float64)
+        chosen_matrix = _local_affine_of_homography(np.asarray(hom, dtype=np.float64), centre)
+    elif hom is not None and hom_ratio >= chosen_ratio - HOMOGRAPHY_DECOMPOSITION_TOLERANCE:
+        # The simpler model won on parsimony, but its centre displacement,
+        # rotation and scale are still wrong under perspective: a least-squares
+        # similarity over a panning wide lens over-reads the centre shift and
+        # invents a scale. When the homography explains the data about as well,
+        # the signature is read from its local affine instead, so every frame's
+        # dx/dy/rotation/scale has ONE definition — the same one the Perceptual
+        # Match predictor uses. `model_used` keeps the parsimonious label.
+        chosen_matrix = _local_affine_of_homography(np.asarray(hom, dtype=np.float64), centre)
 
     if chosen_matrix is None:
         mf.confidence = 0.0
@@ -311,6 +355,9 @@ def parallax_from_transition(mf: MotionFrame) -> float:
     residual_term = float(np.clip((h_resid - HOMOGRAPHY_EXPLAINS_ALL_RESIDUAL) / 3.0, 0.0, 1.0))
     outlier_term = float(np.clip((HOMOGRAPHY_EXPLAINS_ALL_INLIERS - h_ratio) / 0.35, 0.0, 1.0))
     return float(np.clip(0.65 * residual_term + 0.35 * outlier_term, 0.0, 1.0))
+
+
+decompose_similarity = _decompose_similarity
 
 
 def summarise(

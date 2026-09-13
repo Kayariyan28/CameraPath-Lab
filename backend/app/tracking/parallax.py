@@ -36,6 +36,7 @@ import cv2
 import numpy as np
 
 from app.core.logging import get_logger
+from app.tracking.robust import robust
 
 log = get_logger("tracking.parallax")
 
@@ -184,7 +185,7 @@ def analyze_pair(src: np.ndarray, dst: np.ndarray) -> tuple[float, dict]:
         # Too little motion to distinguish anything.
         return 0.0, diag
 
-    h, h_mask = cv2.findHomography(
+    h, h_mask = robust(cv2.findHomography, 
         src, dst, method=cv2.USAC_MAGSAC,
         ransacReprojThreshold=H_THRESHOLD, maxIters=5000, confidence=0.999,
     )
@@ -196,7 +197,7 @@ def analyze_pair(src: np.ndarray, dst: np.ndarray) -> tuple[float, dict]:
     diag["h_inliers"] = h_ratio
     diag["h_residual"] = h_residual
 
-    f, f_mask = cv2.findFundamentalMat(
+    f, f_mask = robust(cv2.findFundamentalMat, 
         src, dst, method=cv2.USAC_MAGSAC,
         ransacReprojThreshold=F_THRESHOLD, confidence=0.999, maxIters=5000,
     )

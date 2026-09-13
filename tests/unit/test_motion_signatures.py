@@ -168,3 +168,36 @@ class TestMotionFrameIntegrity:
             for m in motion.motion_frames:
                 assert 0.0 <= m.confidence <= 1.0
                 assert 0.0 <= m.inlier_ratio <= 1.0
+
+
+class TestHomographyDecomposition:
+    """Regression: dx/dy/rotation/scale from a PERSPECTIVE homography must be read
+    from its local affine at the centre, not from hom[:2, :3]."""
+
+    @staticmethod
+    def _yaw_homography(yaw_deg: float, focal: float, w: int, h: int) -> np.ndarray:
+        th = np.radians(yaw_deg)
+        # Rotation about the camera's vertical axis (OpenCV camera: y down).
+        r = np.array([[np.cos(th), 0, np.sin(th)], [0, 1, 0], [-np.sin(th), 0, np.cos(th)]])
+        k = np.array([[focal, 0, w / 2], [0, focal, h / 2], [0, 0, 1.0]])
+        return k @ r @ np.linalg.inv(k)
+
+    def test_centre_displacement_of_a_pan_is_exact(self):
+        from app.tracking.global_motion import _decompose_similarity, _local_affine_of_homography
+        w, h, focal = 1080, 608, 841.0
+        hom = self._yaw_homography(1.153, focal, w, h)
+        dx, dy, rot, scale = _decompose_similarity(_local_affine_of_homography(hom, (w / 2, h / 2)), (w / 2, h / 2))
+        assert dx == pytest.approx(focal * np.tan(np.radians(1.153)), rel=1e-6)
+        assert abs(dy) < 1e-6
+        assert abs(rot) < 1e-4
+        # Local scale of a pure rotation at the centre is 1/cos, second order.
+        assert scale == pytest.approx(1.0, abs=5e-4)
+
+    def test_naive_upper_block_is_wrong_for_the_same_pan(self):
+        """Documents the defect the fix removes, so the test above discriminates."""
+        from app.tracking.global_motion import _decompose_similarity
+        w, h, focal = 1080, 608, 841.0
+        hom = self._yaw_homography(1.153, focal, w, h)
+        dx, _, _, scale = _decompose_similarity(hom[:2, :3] / hom[2, 2], (w / 2, h / 2))
+        truth = focal * np.tan(np.radians(1.153))
+        assert abs(dx - truth) > 1.0 or abs(scale - 1.0) > 5e-3
