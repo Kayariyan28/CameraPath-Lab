@@ -222,7 +222,8 @@ def _rotation_structure_cost(chains: list[np.ndarray], focal: float, width: int,
 
 
 def estimate_focal_from_homographies(
-    motion_frames: list[MotionFrame], width: int, height: int
+    motion_frames: list[MotionFrame], width: int, height: int,
+    *, matrices: list[np.ndarray] | None = None,
 ) -> tuple[float | None, float]:
     """Focal length from the homographies of a camera that rotates (and zooms).
 
@@ -243,7 +244,10 @@ def estimate_focal_from_homographies(
     where focal is genuinely unobservable, and for shots whose translation makes
     the homography model itself invalid (use the geometric solve's focal there).
     """
-    chains = _homography_chains(motion_frames)
+    # Keyframe homographies (tracking/keyframe_geometry.py), when supplied, are
+    # measured directly over long baselines; chaining per-frame ones accumulates
+    # their bias.
+    chains = list(matrices) if matrices else _homography_chains(motion_frames)
     if len(chains) < 2 or width <= 0 or height <= 0:
         return None, 0.0
 
@@ -325,6 +329,62 @@ def zoom_factor_from_homography(homography: list[float] | None, base: CameraIntr
     return factor if np.isfinite(factor) and factor > 0 else 1.0
 
 
+def _anchor_zoom_to_keyframes(
+    cumulative: np.ndarray,
+    motion_frames: list[MotionFrame],
+    base: CameraIntrinsics,
+    keyframe_homographies: list | None,
+) -> np.ndarray:
+    """Pin the per-frame cumulative zoom to long-baseline keyframe measurements.
+
+    The per-frame product is right about the SHAPE of a zoom and wrong about its
+    total: a real locked-off 59.94 fps shot accumulated a 24% phantom zoom over 899
+    frames that its keyframe chain (16 SIFT homographies) measures as 0.9997. The
+    keyframe chain supplies the value at each keyframe; the per-frame curve keeps
+    its shape between them, with the discrepancy spread linearly in log-zoom.
+    Frames outside a contiguous keyframe chain are left as measured.
+    """
+    if not keyframe_homographies or len(cumulative) == 0:
+        return cumulative
+    # Row r of `cumulative` is the zoom at the TARGET frame of transition r.
+    row_of = {mf.frame_index: r for r, mf in enumerate(motion_frames)}
+    start_frame = motion_frames[0].frame_index - 1  # zoom 1.0 by definition
+    log_dense = np.log(np.maximum(cumulative, 1e-9))
+
+    def dense_at(frame: int) -> float | None:
+        if frame == start_frame:
+            return 0.0
+        r = row_of.get(frame)
+        return None if r is None else float(log_dense[r])
+
+    anchors: list[tuple[float, float]] = []  # (row position, log correction)
+    level = dense_at(keyframe_homographies[0].frame_a)
+    if level is None:
+        return cumulative
+    anchors.append((row_of.get(keyframe_homographies[0].frame_a, -1), 0.0))
+    anchor_log = level
+    previous_b = keyframe_homographies[0].frame_a
+    for pair in keyframe_homographies:
+        if pair.frame_a != previous_b:
+            break  # chain broken: stop anchoring rather than bridge a gap
+        anchor_log += float(np.log(max(zoom_factor_from_homography(pair.homography, base), 1e-9)))
+        measured = dense_at(pair.frame_b)
+        if measured is None:
+            break
+        anchors.append((row_of[pair.frame_b], anchor_log - measured))
+        previous_b = pair.frame_b
+    if len(anchors) < 2:
+        return cumulative
+    rows = np.array([a[0] for a in anchors], dtype=np.float64)
+    corrections = np.array([a[1] for a in anchors], dtype=np.float64)
+    positions = np.arange(len(cumulative), dtype=np.float64)
+    inside = (positions >= rows[0]) & (positions <= rows[-1])
+    correction = np.interp(positions, rows, corrections)
+    # Beyond the last keyframe the last correction holds.
+    log_dense = log_dense + np.where(inside | (positions > rows[-1]), correction, 0.0)
+    return np.exp(log_dense)
+
+
 def build_lens_curve(
     motion_frames: list[MotionFrame],
     base: CameraIntrinsics,
@@ -332,6 +392,7 @@ def build_lens_curve(
     parallax_score: float,
     lens_mode: str = "auto",
     smooth_window: int = 9,
+    keyframe_homographies: list | None = None,
 ) -> tuple[list[LensFrame], str]:
     """Per-frame focal/FOV curve.
 
@@ -357,7 +418,10 @@ def build_lens_curve(
     # Only below the parallax gate, where the homography model is valid, and
     # never over a user override.
     if base.source != "user_override" and parallax_score < 0.15:
-        measured, measured_conf = estimate_focal_from_homographies(motion_frames, base.width, base.height)
+        measured, measured_conf = estimate_focal_from_homographies(
+            motion_frames, base.width, base.height,
+            matrices=[k.matrix() for k in keyframe_homographies] if keyframe_homographies else None,
+        )
         if measured is not None:
             fov = focal_pixels_to_fov(measured, base.width)
             base = intrinsics_from_fov(base.width, base.height, fov, source="estimated",
@@ -368,6 +432,7 @@ def build_lens_curve(
     cumulative = np.cumprod([
         max(zoom_factor_from_homography(mf.homography, base), 1e-3) for mf in motion_frames
     ])
+    cumulative = _anchor_zoom_to_keyframes(cumulative, motion_frames, base, keyframe_homographies)
     net_change = float(cumulative[-1])
 
     # A real zoom moves the scale by more than tracking noise can explain.

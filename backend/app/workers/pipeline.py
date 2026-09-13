@@ -332,6 +332,7 @@ class AnalysisPipeline:
                         "dynamic_region_fraction": res.dynamic_region_fraction,
                         "signature": res.signature.model_dump(),
                         "motion_frames": [m.model_dump() for m in res.motion_frames],
+                        "keyframe_homographies": [k.model_dump() for k in res.keyframe_homographies],
                     },
                 )
             except Exception as exc:  # noqa: BLE001

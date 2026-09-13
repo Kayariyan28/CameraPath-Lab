@@ -55,6 +55,13 @@ class SolveContext:
     max_features: int = 8000
     keyframe_density: float = 1.0
     reporter: StageReporter | None = None
+    #: Long-baseline SIFT homographies between consecutive keyframes
+    #: (tracking/keyframe_geometry.py). The absolute reference for rotation on
+    #: shots without parallax.
+    keyframe_homographies: list | None = None
+    #: The lens curve, so a backend converting image geometry to rotation uses the
+    #: right focal at each keyframe (a zoom changes K between them).
+    lens: list | None = None
 
     def report(self, message: str) -> None:
         if self.reporter:

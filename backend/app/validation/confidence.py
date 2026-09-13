@@ -1210,7 +1210,16 @@ def _build_reasons(ev: _Evidence) -> list[str]:
             f"camera genuinely translated and its path shape is measurable — in normalized "
             f"units, not metres, unless a scale is calibrated.",
         ))
-    if not ev.translation_observable and geometry.succeeded and not ev.perceptual:
+    if (not ev.translation_observable and geometry.succeeded and not ev.perceptual
+            and geometry.source is SolverSource.OPENCV):
+        ranked.append((
+            _DECISIVE,
+            f"Rotation was measured directly from long-baseline homographies between "
+            f"keyframes ({geometry.message.split(';')[0]}), which is exact for a camera "
+            f"that rotates without moving through depth. Camera position is held fixed: "
+            f"no translation was measured, so none is shown.",
+        ))
+    elif not ev.translation_observable and geometry.succeeded and not ev.perceptual:
         ranked.append((
             _DECISIVE,
             f"The {ev.solver_name} solver still returned camera positions. Without a "
@@ -1496,6 +1505,11 @@ def _build_headline(ev: _Evidence) -> str:
             tail = (
                 " No geometric reconstruction succeeded either, so this trajectory rests on "
                 "the 2D motion signature alone."
+            )
+        elif ev.geometry.source is SolverSource.OPENCV:
+            tail = (
+                " Rotation was measured from long-baseline keyframe geometry, and the "
+                "camera position is held fixed rather than invented."
             )
         else:
             tail = (

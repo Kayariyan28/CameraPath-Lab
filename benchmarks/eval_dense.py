@@ -34,6 +34,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("scene")
     ap.add_argument("--solver", default="auto", choices=["auto", "colmap", "perceptual"])
+    ap.add_argument("--clip", default=None, help="evaluate this video instead of benchmarks/synthetic/<scene>.mp4")
     args = ap.parse_args()
 
     clip = REPO / "benchmarks/synthetic" / f"{args.scene}.mp4"
@@ -44,17 +45,19 @@ def main() -> int:
     shot = shots[0]
     motion = analyze_shot_motion(info, shot, frames, long_edge=1080, max_features=2400)
     intr, _ = initial_intrinsics(info, *motion.analysis_size)
-    lens, lens_note = build_lens_curve(motion.motion_frames, intr, parallax_score=motion.parallax.score)
+    lens, lens_note = build_lens_curve(motion.motion_frames, intr, parallax_score=motion.parallax.score,
+                                       keyframe_homographies=motion.keyframe_homographies)
     ctx = SolveContext(
         info=info, shot=shot, frames_meta=frames, motion_frames=motion.motion_frames,
         intrinsics=intr, analysis_size=motion.analysis_size,
         parallax_score=motion.parallax.score, texture_score=motion.texture,
-        work_dir=Path(tempfile.mkdtemp(prefix="cpl_dense_")), geometry_long_edge=2048, max_features=8000,
+        work_dir=Path(tempfile.mkdtemp(prefix="cpl_dense_")), geometry_long_edge=2048, max_features=8000, keyframe_homographies=motion.keyframe_homographies, lens=lens,
     )
     from app.solvers.colmap_solver import PyColmapBackend
+    from app.solvers.opencv_solver import OpenCVPoseBackend
     from app.solvers.perceptual_solver import PerceptualMatchBackend
     order = {"colmap": [PyColmapBackend], "perceptual": [PerceptualMatchBackend],
-             "auto": [PyColmapBackend, PerceptualMatchBackend]}[args.solver]
+             "auto": [PyColmapBackend, OpenCVPoseBackend, PerceptualMatchBackend]}[args.solver]
     geo, why = None, ""
     for Backend in order:
         backend = Backend()

@@ -42,6 +42,14 @@ clear margin. That picked 1.0 on handheld and 0.0 on every smooth move above,
 matching or beating the best fixed choice on all seven synthetic scenes. It uses
 nothing but the solve's own anchors, so it runs on real footage.
 
+On a shot with no observable translation (the OpenCV rotation rung, Perceptual
+Match) the contamination this guards against is absent: flow-to-rotation is then
+physically valid. There the residual is NOT high-passed — with sparse keyframes the
+low-frequency part is the genuine shape of the move between them, and filtering it
+out left a synthetic tilt at 0.20 deg — and it is applied unless held-out anchors
+show it doing harm. Anchor correction still pins accumulated drift at every
+keyframe.
+
 Motion Fidelity scales the selected gain: EXACT applies it in full (the most
 faithful estimate of the source's motion, shake included where the data
 supports it, I10); CLEAN halves it; SMOOTH drops it.
@@ -794,7 +802,9 @@ def _fuse_against_anchors(
 
     data_gain = 0.0
     if has_dense and len(rows) >= MIN_ANCHORS_FOR_HOLDOUT and fidelity_gain > 0:
-        data_gain, scores = _holdout_residual_gain(rows, anchor_quats, times, dense_path, window)
+        data_gain, scores = _holdout_residual_gain(
+            rows, anchor_quats, times, dense_path, window, rotation_only=not translation_observable,
+        )
         log.info(
             "shot %d residual gain %.2f from held-out anchors (mean error by gain: %s)",
             shot_id, data_gain, ", ".join(f"{g:g}:{e:.3f}deg" for g, e in scores.items()),
@@ -804,7 +814,7 @@ def _fuse_against_anchors(
     quats = anchor_path.copy()
     if applied > 0:
         residual = _corrected_residual(
-            np.arange(n), rows, times, dense_path, window
+            np.arange(n), rows, times, dense_path, window, high_pass=translation_observable,
         )
         for i in range(n):
             quats[i] = quat_normalize(quat_multiply(anchor_path[i], quat_exp(applied * residual[i])))
@@ -901,6 +911,7 @@ def _corrected_residual(
     times: np.ndarray,
     dense_path: np.ndarray,
     window: int,
+    high_pass: bool = True,
 ) -> np.ndarray:
     """High-passed rotation residual of the dense path over `seg_rows`, relative to
     its own SQUAD trend through `ctrl_rows`, forced to zero at the control rows so
@@ -912,7 +923,8 @@ def _corrected_residual(
     seg_times = times[seg_rows]
     trend = resample_rotations(times[ctrl_rows], dense_path[ctrl_rows], seg_times)
     residual = np.array([quat_log(quat_relative(trend[j], dense_path[r])) for j, r in enumerate(seg_rows)])
-    residual = residual - _moving_average(residual, window)
+    if high_pass:
+        residual = residual - _moving_average(residual, window)
     inside = [k for k, r in enumerate(seg_rows) if r in set(ctrl_rows.tolist())]
     if inside:
         at = seg_times[inside]
@@ -927,6 +939,7 @@ def _holdout_residual_gain(
     times: np.ndarray,
     dense_path: np.ndarray,
     window: int,
+    rotation_only: bool = False,
 ) -> tuple[float, dict[float, float]]:
     """Pick the residual gain that best predicts anchors the fill has not seen.
 
@@ -951,7 +964,8 @@ def _holdout_residual_gain(
         seg_lo = max(0, rows[k - 1] - half)
         seg_hi = min(len(times), rows[k + 1] + half + 1)
         seg = np.arange(seg_lo, seg_hi)
-        residual = _corrected_residual(seg, ctrl, times, dense_path, window)[rows[k] - seg_lo]
+        residual = _corrected_residual(seg, ctrl, times, dense_path, window,
+                                       high_pass=not rotation_only)[rows[k] - seg_lo]
         for g in HOLDOUT_GAINS:
             prediction = predicted_base if g == 0 else quat_multiply(predicted_base, quat_exp(g * residual))
             errors[g].append(float(np.degrees(quat_angular_distance(prediction, anchor_quats[k]))))
@@ -959,6 +973,13 @@ def _holdout_residual_gain(
     scores = {g: float(np.mean(v)) for g, v in errors.items() if v}
     if not scores:
         return 0.0, {}
+    if rotation_only:
+        # Burden of proof reversed: with no translation, flow-to-rotation is
+        # physically valid, so the residual is used unless held-out anchors show
+        # it doing harm.
+        if scores.get(1.0, float("inf")) <= scores[0.0]:
+            return 1.0, scores
+        return float(min(scores, key=scores.get)), scores
     best = min(scores, key=scores.get)
     if best > 0 and scores[best] > HOLDOUT_REQUIRED_IMPROVEMENT * scores[0.0]:
         best = 0.0

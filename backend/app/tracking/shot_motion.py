@@ -27,6 +27,7 @@ from app.tracking.dynamic_rejection import GeometricDynamicRejector
 from app.tracking.features import blur_score, normalize_contrast, texture_score
 from app.tracking.flow import LucasKanadeTracker
 from app.tracking.global_motion import estimate_transition, summarise
+from app.tracking.keyframe_geometry import KeyframeHomography, KeyframeTracker
 from app.tracking.parallax import (
     ParallaxEvidence,
     TrackSnapshotRecorder,
@@ -52,6 +53,10 @@ class ShotMotionResult:
     parallax: ParallaxEvidence = field(default_factory=ParallaxEvidence)
     """Wide-baseline parallax evidence. This decides whether translation is
     observable, and therefore which solver the shot is routed to."""
+
+    keyframe_homographies: list[KeyframeHomography] = field(default_factory=list)
+    """SIFT homographies between consecutive keyframes: the long-baseline
+    reference for absolute rotation and zoom (see keyframe_geometry)."""
 
     persistent_track_count: int = 0
     mean_track_age: float = 0.0
@@ -151,6 +156,7 @@ def analyze_shot_motion(
     decoder = FrameDecoder(info, long_edge=long_edge, gray=True)
     tracker = LucasKanadeTracker(max_features=max_features)
     rejector = GeometricDynamicRejector()
+    keyframes = KeyframeTracker(width)
 
     by_index = {fm.frame_index: fm for fm in frames_meta}
     start_time = by_index.get(shot.start_frame)
@@ -184,11 +190,13 @@ def analyze_shot_motion(
             texture_samples.append(texture_score(frame))
             blur_samples.append(blur_score(frame))
 
-        flow_result = tracker.track(frame_index, normalize_contrast(frame))
+        normalized = normalize_contrast(frame)
+        flow_result = tracker.track(frame_index, normalized)
         processed += 1
 
         if flow_result is None:
             prev_time = timestamp
+            keyframes.observe(frame_index, timestamp, normalized, None)
             continue
 
         # Real elapsed time, from measured PTS. Never 1/fps (invariant I1/I2).
@@ -207,10 +215,12 @@ def analyze_shot_motion(
             flow_result, timestamp, dt, (width, height), weights=weights
         )
         motion_frames.append(mf)
+        keyframes.observe(frame_index, timestamp, normalized, mf)
 
         if reporter and processed % 20 == 0:
             reporter.progress(processed / total, f"shot {shot.id}: frame {processed}/{total}")
 
+    keyframe_homographies = keyframes.finish()
     texture = float(np.mean(texture_samples)) if texture_samples else 0.0
     blur = float(np.mean(blur_samples)) if blur_samples else 1.0
 
@@ -263,6 +273,7 @@ def analyze_shot_motion(
         total_tracks_spawned=tracker.total_spawned(),
         dynamic_region_fraction=dyn,
         parallax=parallax,
+        keyframe_homographies=keyframe_homographies,
         texture=texture,
         blur=blur,
         warnings=warnings,

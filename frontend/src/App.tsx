@@ -208,7 +208,11 @@ export function App() {
             <span className="spacer" />
             {trajectory ? (
               <span className={`badge ${trajectory.pipeline_mode_used === 'physical_3d' ? 'ok' : 'warn'}`}>
-                {trajectory.pipeline_mode_used === 'physical_3d' ? 'recovered 3D camera path' : 'perceptual match · screen-space equivalent'}
+                {trajectory.pipeline_mode_used !== 'physical_3d'
+                  ? 'perceptual match · screen-space equivalent'
+                  : trajectory.confidence.translation_observable
+                    ? 'recovered 3D camera path'
+                    : 'measured rotation · position fixed'}
               </span>
             ) : frames.length > 0 && (
               <span className="badge warn">image-space · not yet a 3D camera path</span>

@@ -43,7 +43,9 @@ from app.models.schemas.trajectory import (
 )
 from app.solvers.base import SolveContext, solve_with_fallback
 from app.solvers.colmap_solver import PyColmapBackend
+from app.solvers.opencv_solver import OpenCVPoseBackend
 from app.solvers.perceptual_solver import PerceptualMatchBackend
+from app.tracking.keyframe_geometry import KeyframeHomography
 from app.trajectory.exporters import TRAJECTORY_STEM, export_all, shot_stem
 from app.trajectory.fusion import fuse_lens_curve, fuse_trajectory
 from app.trajectory.kinematics import compute_kinematics, path_length, total_rotation_degrees
@@ -65,6 +67,7 @@ class ShotInputs:
     analysis_size: tuple[int, int]
     texture: float
     blur: float
+    keyframe_homographies: list = None  # list[KeyframeHomography]
 
 
 class SolvePipeline:
@@ -103,6 +106,9 @@ class SolvePipeline:
             analysis_size=(int(raw["analysis_size"][0]), int(raw["analysis_size"][1])),
             texture=float(raw.get("texture", 0.0)),
             blur=float(raw.get("blur", 1.0)),
+            keyframe_homographies=[
+                KeyframeHomography.model_validate(k) for k in raw.get("keyframe_homographies", [])
+            ],
         )
 
     def _backends(self, settings: SolveSettings, reporter: StageReporter) -> list:
@@ -111,14 +117,16 @@ class SolvePipeline:
             return [PerceptualMatchBackend()]
         if not colmap_ok:
             reporter.warning(
-                "COLMAP disabled or unavailable; using Perceptual Match, which reproduces "
-                "screen-space motion rather than a physical path"
+                "COLMAP disabled or unavailable; translation cannot be reconstructed, so "
+                "rotation comes from keyframe geometry or Perceptual Match"
             )
-            return [PerceptualMatchBackend()]
+            return [OpenCVPoseBackend(), PerceptualMatchBackend()]
         # PHYSICAL_3D still keeps Perceptual Match as the last rung: the product
         # always returns the best honest result (spec §28), and the confidence
-        # report states that the physical solve did not succeed.
-        return [PyColmapBackend(), PerceptualMatchBackend()]
+        # report states that the physical solve did not succeed. The OpenCV rung
+        # measures rotation from keyframe homographies on shots COLMAP declines
+        # for lack of parallax.
+        return [PyColmapBackend(), OpenCVPoseBackend(), PerceptualMatchBackend()]
 
     # ------------------------------------------------------------------ solve
 
@@ -213,6 +221,7 @@ class SolvePipeline:
         lens, lens_note = build_lens_curve(
             inputs.motion_frames, intrinsics, parallax_score=parallax,
             lens_mode=settings.lens_mode.value,
+            keyframe_homographies=inputs.keyframe_homographies,
         )
         reporter.info(f"shot {shot.id}: intrinsics — {provenance}; lens — {lens_note}")
 
@@ -226,6 +235,7 @@ class SolvePipeline:
             texture_score=inputs.texture, work_dir=work_dir,
             geometry_long_edge=geometry_edge, max_features=max_features,
             keyframe_density=density, reporter=reporter,
+            keyframe_homographies=inputs.keyframe_homographies, lens=lens,
         )
         geometry, decisions = solve_with_fallback(
             self._backends(settings, reporter), context,
@@ -236,8 +246,12 @@ class SolvePipeline:
                 f"shot {shot.id}: physical 3D reconstruction was requested but could not be "
                 f"produced; returning {geometry.source.value} instead"
             )
+        # Both COLMAP and the keyframe-rotation rung MEASURE the camera physically
+        # (the latter rotation only); Perceptual Match optimises screen-space
+        # appearance instead. `translation_observable` says which physical kind.
         mode_used = (
-            PipelineMode.PHYSICAL_3D if geometry.source is SolverSource.COLMAP
+            PipelineMode.PHYSICAL_3D
+            if geometry.source in (SolverSource.COLMAP, SolverSource.OPENCV)
             else PipelineMode.PERCEPTUAL_MATCH
         )
 
@@ -362,8 +376,12 @@ class SolvePipeline:
             parts.append("translation not observable — rotation and lens only")
         if max(fovs) - min(fovs) > 0.5:
             parts.append(f"FOV {fovs[0]:.1f} to {fovs[-1]:.1f} deg")
-        how = ("physical 3D reconstruction" if mode_used is PipelineMode.PHYSICAL_3D
-               else "screen-space Perceptual Match (not a physical camera path)")
+        if geometry.source is SolverSource.OPENCV:
+            how = "rotation measured from long-baseline keyframe geometry, position held fixed"
+        elif mode_used is PipelineMode.PHYSICAL_3D:
+            how = "physical 3D reconstruction"
+        else:
+            how = "screen-space Perceptual Match (not a physical camera path)"
         return f"{'; '.join(parts)}. Solved by {how}. Optical camera pose, not a drone body pose."
 
     # ----------------------------------------------------------------- render
