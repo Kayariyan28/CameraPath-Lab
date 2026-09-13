@@ -31,3 +31,6 @@ frontend/public/dev-fixtures/
 # Synthetic ground-truth renders — regenerate with scripts/render_synthetic.sh
 benchmarks/synthetic/
 benchmarks/clips/
+
+# Real-footage test clips (third-party samples, not committed)
+benchmarks/real/

@@ -29,6 +29,7 @@ from app.blender.runner import BlenderRunner, probe_mp4
 from app.core.environment import Environment, detect_environment
 from app.core.logging import StageReporter, get_logger
 from app.core.paths import Workspace
+from app.geometry.conventions import orient_trajectory_z_up
 from app.geometry.intrinsics import build_lens_curve, initial_intrinsics
 from app.models.schemas.jobs import Job, JobState, SolveSettings, Stage, StageProgress
 from app.models.schemas.motion import MotionFrame, MotionSignature
@@ -248,6 +249,14 @@ class SolvePipeline:
             translation_observable=geometry.translation_observable,
         )
 
+        # ---- world orientation --------------------------------------------------
+        # A geometric solve's world has no gravity: COLMAP's is its first camera's
+        # OpenCV frame, so exports claimed +Z up while the cameras' up pointed
+        # along -Y and the proxy filmed the cage sideways. Perceptual Match
+        # already defines its world from a level first camera.
+        if geometry.source in (SolverSource.COLMAP, SolverSource.OPENCV, SolverSource.VGGT) and poses:
+            poses = self._orient_z_up(poses, reporter, shot.id)
+
         # ---- scale (I5) --------------------------------------------------------
         poses, normalized_scale = normalize_trajectory(poses)
         scale_mode, units, metric_factor = ScaleMode.NORMALIZED, "normalized", None
@@ -296,6 +305,21 @@ class SolvePipeline:
             f"confidence {confidence.level.value} ({confidence.score:.2f})"
         )
         return trajectory
+
+    @staticmethod
+    def _orient_z_up(poses, reporter: StageReporter, shot_id: int):
+        positions = np.array([p.position for p in poses], dtype=np.float64)
+        quats = [np.array(p.quaternion, dtype=np.float64) for p in poses]
+        positions, quats, rotation = orient_trajectory_z_up(positions, quats)
+        tilt = float(np.degrees(np.arccos(np.clip(rotation[2, 2], -1.0, 1.0))))
+        reporter.info(
+            f"shot {shot_id}: world re-oriented to Z-up by {tilt:.1f} deg "
+            "(estimated from camera orientations; relative motion unchanged)"
+        )
+        return [
+            p.model_copy(update={"position": [float(v) for v in pos], "quaternion": [float(v) for v in q]})
+            for p, pos, q in zip(poses, positions, quats)
+        ]
 
     def _confidence(self, geometry, inputs: ShotInputs, poses, lens, decisions, mode_used,
                     reporter: StageReporter) -> ConfidenceReport:

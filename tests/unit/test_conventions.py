@@ -261,3 +261,52 @@ class TestNoSilentHandednessFlip:
             out = fn(m)
             assert np.isclose(np.linalg.det(out), 1.0, atol=1e-9)
             assert np.allclose(out @ out.T, np.eye(3), atol=1e-9)
+
+
+class TestWorldUpFromRightVectors:
+    """Pitched-down cameras keep horizontal right vectors; up vectors do not."""
+
+    @staticmethod
+    def _pitched_orbit(pitch_deg: float, world_tilt: np.ndarray) -> list[np.ndarray]:
+        from app.geometry.rotations import quat_from_axis_angle, quat_multiply, matrix_to_quat
+        quats = []
+        for yaw in np.linspace(0, 1.6, 24):
+            q = quat_multiply(quat_from_axis_angle(np.array([0, 0, 1.0]), yaw),
+                              quat_from_axis_angle(np.array([1.0, 0, 0]), np.radians(-pitch_deg)))
+            quats.append(quat_multiply(matrix_to_quat(world_tilt), q))
+        return quats
+
+    def test_pitched_down_orbit_recovers_true_up(self):
+        from app.geometry.conventions import estimate_world_up
+        from app.geometry.rotations import quat_from_axis_angle, quat_to_matrix
+        tilt = quat_to_matrix(quat_from_axis_angle(np.array([0.3, 1.0, 0.1]) / np.linalg.norm([0.3, 1.0, 0.1]), 1.1))
+        up = estimate_world_up(self._pitched_orbit(60.0, tilt))
+        assert np.degrees(np.arccos(np.clip(up @ (tilt @ Z), -1, 1))) < 0.5
+
+    def test_mean_up_alone_would_be_60_degrees_off(self):
+        """Documents why right vectors are preferred."""
+        from app.geometry.conventions import camera_up
+        quats = self._pitched_orbit(60.0, np.eye(3))
+        mean_up = np.mean([camera_up(q) for q in quats], axis=0)
+        mean_up /= np.linalg.norm(mean_up)
+        assert np.degrees(np.arccos(np.clip(mean_up @ Z, -1, 1))) > 50
+
+    def test_no_yaw_variety_falls_back_to_mean_up(self):
+        from app.geometry.conventions import estimate_world_up
+        from app.geometry.rotations import quat_from_axis_angle
+        quats = [quat_from_axis_angle(np.array([1.0, 0, 0]), np.radians(5 * np.sin(i))) for i in range(10)]
+        assert estimate_world_up(quats) @ Z > 0.99
+
+
+def test_banking_camera_does_not_trust_the_right_vector_plane():
+    """An FPV turn banks the camera, so right vectors leave the horizontal plane.
+    Their normal was measured 51.5 deg off gravity; the estimate must fall back."""
+    from app.geometry.conventions import estimate_world_up
+    from app.geometry.rotations import quat_from_axis_angle, quat_multiply
+    quats = []
+    for i, yaw in enumerate(np.linspace(0, 0.9, 30)):
+        bank = np.radians(13.0 * np.sin(i / 4.0))
+        quats.append(quat_multiply(quat_from_axis_angle(np.array([0, 0, 1.0]), yaw),
+                                   quat_from_axis_angle(np.array([0, 1.0, 0]), bank)))
+    up = estimate_world_up(quats)
+    assert np.degrees(np.arccos(np.clip(up @ Z, -1, 1))) < 6.0

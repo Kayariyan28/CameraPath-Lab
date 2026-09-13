@@ -90,12 +90,31 @@ class DynamicRejectionBackend(Protocol):
         *,
         strength: float = 0.5,
         parallax_present: bool = False,
+        dt: float = 1.0 / 30.0,
     ) -> np.ndarray:
         """Return per-correspondence background confidence in [0,1], aligned
         with `flow_result.track_ids`."""
         ...
 
     def reset(self) -> None: ...
+
+
+#: Time constant of each track's residual drift accumulator, seconds. Defined in
+#: seconds so the cue does not depend on frame rate.
+DRIFT_TIME_CONSTANT = 0.5
+
+#: Accumulated residual displacement, px at analysis resolution, beyond which a
+#: track counts as moving against the scene.
+#:
+#: Why a per-frame threshold alone is not enough: it is frame-rate dependent. On a
+#: real 59.94 fps store-aisle clip, people walking through a locked-off shot moved
+#: 1-3 px per frame, never crossed the per-frame threshold, and not one track was
+#: rejected in 899 frames. Their approach toward the lens read as a steady
+#: expansion, which accumulated into a 24% phantom zoom and 4 deg of phantom
+#: rotation. Integrated over time the same walker drifts tens of pixels, while
+#: static background noise (~0.1-0.3 px per frame) has a steady-state drift of
+#: roughly 0.4-1.2 px at 60 fps. 4 px is well clear of that.
+DRIFT_THRESHOLD_PX = 4.0
 
 
 class GeometricDynamicRejector:
@@ -141,8 +160,8 @@ class GeometricDynamicRejector:
     @staticmethod
     def _rigid_scene_residuals(
         src: np.ndarray, dst: np.ndarray, similarity_residuals: np.ndarray,
-        *, use_epipolar: bool,
-    ) -> tuple[np.ndarray, str]:
+        *, use_epipolar: bool, similarity_vectors: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, str, np.ndarray | None]:
         """Residual against the best available STATIC-SCENE model.
 
         The similarity residual alone is not a moving-object detector once the
@@ -186,9 +205,12 @@ class GeometricDynamicRejector:
         """
         best = similarity_residuals
         used = "similarity"
+        # Residual VECTOR of whichever rigid model explains each point best, for
+        # the drift accumulator. None means "no usable evidence this frame".
+        vectors = None if similarity_vectors is None else similarity_vectors.copy()
 
         if len(src) < 20:
-            return best, used
+            return best, used, vectors
 
         motion = float(np.median(np.linalg.norm(dst - src, axis=1)))
 
@@ -202,8 +224,12 @@ class GeometricDynamicRejector:
             proj = homo @ np.asarray(h).T
             w = proj[:, 2:3]
             w = np.where(np.abs(w) < 1e-12, 1e-12, w)
-            h_res = np.linalg.norm(proj[:, :2] / w - dst, axis=1)
+            h_vec = proj[:, :2] / w - dst
+            h_res = np.linalg.norm(h_vec, axis=1)
             if np.isfinite(h_res).all():
+                if vectors is not None:
+                    take = h_res < best
+                    vectors[take] = -h_vec[take]
                 best = np.minimum(best, h_res)
                 used = "similarity+homography"
 
@@ -227,10 +253,18 @@ class GeometricDynamicRejector:
                 den = np.where(den < 1e-12, 1e-12, den)
                 sampson = np.sqrt(num / den)
                 if np.isfinite(sampson).all():
+                    if vectors is not None:
+                        # Consistent with a rigid scene through depth: no drift.
+                        vectors[sampson < best] = 0.0
                     best = np.minimum(best, sampson)
                     used = used + "+epipolar"
+        elif use_epipolar:
+            # Parallax is present but the epipolar test could not run on this
+            # frame (too little motion to condition it). A 2D residual here is
+            # parallax as much as motion, so it is not evidence either way.
+            vectors = None
 
-        return best, used
+        return best, used, vectors
 
     @staticmethod
     def _is_stuck_track_cluster(
@@ -337,10 +371,12 @@ class GeometricDynamicRejector:
         *,
         strength: float = 0.5,
         parallax_present: bool = False,
+        dt: float = 1.0 / 30.0,
     ) -> np.ndarray:
         """`parallax_present` must come from a real measurement (see
         tracking/parallax.py), not a guess — it selects which static-scene model
-        this frame is judged against."""
+        this frame is judged against. `dt` is the measured time since the previous
+        frame, which makes the drift cue frame-rate independent."""
         n = flow_result.count
         if n == 0:
             return np.empty((0,), np.float32)
@@ -356,9 +392,11 @@ class GeometricDynamicRejector:
 
         # Judge against the best rigid-scene interpretation, not against a single
         # 2D transform — otherwise parallax reads as moving content.
-        residuals, self._model_used = self._rigid_scene_residuals(
-            src, dst, similarity_residuals, use_epipolar=parallax_present
+        residuals, self._model_used, drift_vectors = self._rigid_scene_residuals(
+            src, dst, similarity_residuals, use_epipolar=parallax_present,
+            similarity_vectors=residual_vectors,
         )
+        decay = float(np.exp(-max(dt, 1e-6) / DRIFT_TIME_CONSTANT))
 
         # Scale the tolerance to this transition's own motion, not a constant.
         median_flow = float(np.median(np.linalg.norm(dst - src, axis=1))) if len(src) else 0.0
@@ -381,7 +419,13 @@ class GeometricDynamicRejector:
             if tr is None:
                 continue
 
-            if disagrees[i]:
+            drifting = False
+            if drift_vectors is not None:
+                tr.drift_x = decay * tr.drift_x + float(drift_vectors[i, 0])
+                tr.drift_y = decay * tr.drift_y + float(drift_vectors[i, 1])
+                drifting = float(np.hypot(tr.drift_x, tr.drift_y)) > DRIFT_THRESHOLD_PX
+
+            if disagrees[i] or drifting:
                 # Coherent disagreement is much stronger evidence than isolated
                 # disagreement, so it counts double.
                 tr.disagreements += 2 if coherent[i] else 1

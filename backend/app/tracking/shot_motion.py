@@ -201,6 +201,7 @@ def analyze_shot_motion(
             flow_result, tracker.tracks, (width, height),
             strength=dynamic_strength,
             parallax_present=parallax.translation_observable,
+            dt=dt,
         )
         mf = estimate_transition(
             flow_result, timestamp, dt, (width, height), weights=weights

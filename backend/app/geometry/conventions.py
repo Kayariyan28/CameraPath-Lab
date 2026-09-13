@@ -187,29 +187,73 @@ def camera_up(quat_cpl_wxyz: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+#: Right vectors must spread at least this much (second/first singular value)
+#: before they define the up direction. Below it the shot has too little yaw
+#: variety for the horizontal plane to be pinned down.
+RIGHT_VECTOR_SPREAD_MIN = 0.1
+
+#: The right-vector estimate is used only when it is self-consistent: the roll it
+#: implies for each camera (angle of the right axis out of the estimated
+#: horizontal plane), as an RMS, divided by the right-vector spread, must stay
+#: under this many degrees. The ratio behaves like an error bound: little spread
+#: amplifies any roll into a badly tilted plane. Measured on solved cameras: an
+#: orbit 0.004 deg / 0.56 spread -> 0.007 (estimate exact); an FPV curve banking
+#: +-13 deg 3.83 deg / 0.195 -> 19.6, where the right-vector plane was 51.5 deg off
+#: gravity and the mean-up fallback was 3 deg off.
+RIGHT_VECTOR_ERROR_BOUND_DEG = 2.0
+
+
 def estimate_world_up(quats_cpl: list[np.ndarray]) -> np.ndarray:
-    """Estimate which world direction is "up" from the cameras' own up vectors.
+    """Estimate which world direction is "up" from the cameras' orientations.
 
     A structure-from-motion world frame has no inherent orientation — COLMAP's
-    axes are whatever the initial image pair happened to imply. But a Blender
-    scene with a ground plane needs an up direction, and a trajectory presented
-    in an arbitrarily tilted frame reads as a camera that was mounted crooked.
+    axes are whatever the initial image pair implied (in practice the first
+    camera's OpenCV frame, y down). A Blender scene with a ground plane needs an
+    up direction, and without one the proxy films the cage with gravity sideways:
+    exported COLMAP orbits had camera up (0, -1, 0) while claiming +Z up.
 
-    This is a *heuristic*, and labelled as one wherever it is used: it assumes
-    the operator kept the camera roughly upright for most of the shot, which is
-    true of the overwhelming majority of footage but false for, say, a barrel
-    roll. It never changes relative motion — only the frame it is expressed in.
+    Two cues, both heuristics and labelled as such:
+
+      * Camera RIGHT vectors (preferred). Operators rarely roll, so a camera's
+        right axis stays horizontal even when it pitches down — which is exactly
+        when the up-vector cue fails (a drone looking 60 deg down has its up
+        vector 60 deg off gravity). When the shot has yaw variety the right
+        vectors span the horizontal plane, and up is its normal. Used only when
+        that no-roll hypothesis checks out (see RIGHT_VECTOR_ERROR_BOUND_DEG):
+        a banking FPV move otherwise tilts the estimate by tens of degrees.
+      * Mean camera UP vector (fallback, when right vectors do not spread — no
+        yaw variety). Assumes the camera was kept roughly level on average, so a
+        steadily pitched-down shot with no yaw is re-levelled incorrectly.
+
+    Never changes relative motion — only the frame it is expressed in.
     """
     if not quats_cpl:
         return np.array([0.0, 0.0, 1.0])
     ups = np.array([camera_up(q) for q in quats_cpl])
     mean_up = ups.mean(axis=0)
-    n = float(np.linalg.norm(mean_up))
-    if n < 1e-6:
-        # The camera's up vectors cancelled out, e.g. a full roll. No usable
-        # estimate; keep the existing frame rather than guessing.
+    mean_norm = float(np.linalg.norm(mean_up))
+
+    rights = np.array([camera_axes(q)[0] for q in quats_cpl])
+    if len(rights) >= 3:
+        # Rows are unit vectors; their scatter matrix's weakest direction is the
+        # one they are all perpendicular to.
+        _, sv, vt = np.linalg.svd(rights, full_matrices=False)
+        spread = float(sv[1] / sv[0]) if sv[0] > 1e-9 else 0.0
+        implied_roll_rms = float(np.degrees(np.sqrt(np.mean(
+            np.arcsin(np.clip(rights @ vt[-1], -1.0, 1.0)) ** 2
+        ))))
+        if spread >= RIGHT_VECTOR_SPREAD_MIN and implied_roll_rms / spread <= RIGHT_VECTOR_ERROR_BOUND_DEG:
+            normal = vt[-1]
+            if mean_norm > 1e-6 and float(normal @ mean_up) < 0:
+                normal = -normal
+            n = float(np.linalg.norm(normal))
+            if n > 1e-9:
+                return normal / n
+
+    if mean_norm < 1e-6:
+        # Up vectors cancelled out, e.g. a full roll. Keep the existing frame.
         return np.array([0.0, 0.0, 1.0])
-    return mean_up / n
+    return mean_up / mean_norm
 
 
 def rotation_aligning(source: np.ndarray, target: np.ndarray) -> np.ndarray:

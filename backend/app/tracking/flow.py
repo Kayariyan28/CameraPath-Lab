@@ -60,6 +60,12 @@ class Track:
     residual_ema: float = 0.0
     """Smoothed reprojection residual against the dominant model, px."""
 
+    drift_x: float = 0.0
+    drift_y: float = 0.0
+    """Leaky running sum of this track's residual VECTOR against the best rigid
+    scene model, px. Static background accumulates only zero-mean noise; a moving
+    object accumulates a steady displacement. See dynamic_rejection DRIFT_*."""
+
     background_confidence: float = 0.5
     """0-1. Only high-confidence tracks drive camera estimation."""
 
