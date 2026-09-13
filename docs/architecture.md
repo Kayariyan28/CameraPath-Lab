@@ -278,16 +278,94 @@ conservative ones from the same code path.
 
 ---
 
-## 11. Phase plan
+## 11. Phase status
 
 | Phase | Content | Status |
 |-------|---------|--------|
-| 1 | React shell, FastAPI, upload, ffprobe, decode, shot detect, optical flow, motion curves | **this milestone** |
-| 2 | pycolmap SfM, pose extraction, trajectory JSON, Three.js viewer, synthetic validation | next |
-| 3 | Blender headless motion cage, animated camera, MP4 render — usable end-to-end | next |
-| 4 | Perceptual Match, zoom/FOV estimation, confidence system, dynamic rejection | later |
-| 5 | Optional VGGT, MPS, sliding windows, pose fusion, BA refinement | later |
-| 6 | Performance, UX polish, full test suite | later |
+| 1 | React shell, FastAPI, upload, ffprobe, decode, shot detection, optical flow, motion curves | done |
+| 2 | pycolmap SfM, pose extraction, trajectory JSON, Three.js viewer, synthetic validation | done |
+| 3 | Blender headless motion cage, animated camera, verified MP4 render — usable end to end | done |
+| 4 | Perceptual Match, keyframe-rotation rung, zoom/FOV, confidence, dynamic rejection, classification | done |
+| 5 | Optional VGGT, MPS, sliding windows | **not started** (PyTorch not installed; see §14) |
+| 6 | Performance, UX polish, broader tests | partial |
 
-Phase 5 is deliberately last: a learned backend is impossible to evaluate without the
-deterministic baseline and the synthetic ground-truth harness already in place.
+## 12. Solver ladder as built
+
+```
+parallax measured over wide baselines (tracking/parallax.py)
+  │
+  ├─ translation observable ──► COLMAP  (focal probed, mis-registrations rejected,
+  │                                       world oriented to gravity)
+  ├─ no parallax ─────────────► OpenCVPoseBackend: rotation from long-baseline
+  │                              keyframe homographies, position held fixed
+  ├─ matching fails ──────────► Perceptual Match (screen-space)
+  └─ nothing works ───────────► 2D motion proxy, LOW confidence
+            │
+            ▼
+fusion: SQUAD through anchors + per-frame residual at a gain chosen by
+held-out anchors; translation Hermite in time; extrapolation past end anchors
+```
+
+Two ideas carry most of the accuracy, and both came from measured failures:
+
+- **Absolute quantities from long baselines, detail from per-frame motion.** Per-frame
+  estimates are precise about shape and biased in accumulation (a real 900-frame shot
+  accumulated a 24% phantom zoom). Keyframe SIFT homographies and SfM anchors pin the
+  totals; per-frame flow fills between them.
+- **Let held-out anchors decide how much per-frame detail to trust.** Flow-to-rotation
+  is exact without translation and mostly parallax with it. A fixed rule is wrong on
+  one side or the other; holding anchors out picks correctly on every synthetic scene.
+
+## 13. Validation results
+
+Synthetic Blender ground truth, 60 frames at 30 fps, every source frame scored
+(`benchmarks/run_dense_suite.sh`). Rotation MAE is aligned on the solver's anchors and
+shape error on all dense positions; see `benchmarks/eval_dense.py`.
+
+| scene | solver | rotation MAE | shape | speed | result |
+|-------|--------|-------------:|------:|------:|--------|
+| accelerating | COLMAP | 0.022° | 0.01% | 0.0% | pass |
+| crane_up | COLMAP | 0.024° | 0.01% | 0.0% | pass |
+| decelerating | COLMAP | 0.013° | 0.01% | 0.0% | pass |
+| diagonal_flythrough | COLMAP | 0.098° | 0.01% | 0.1% | pass |
+| dolly_backward | COLMAP | 0.008° | 0.00% | 0.0% | pass |
+| dolly_forward | COLMAP | 0.007° | 0.00% | 0.0% | pass |
+| fpv_curve | COLMAP | 0.070° | 0.01% | 0.1% | pass |
+| handheld | COLMAP | 0.457° | 1.09% | 27.0% | pass (weak) |
+| moving_object | COLMAP | 0.036° | 0.01% | 0.0% | pass |
+| orbit | COLMAP | 0.057° | 0.42% | 0.4% | pass |
+| pedestal_up | COLMAP | 0.013° | 0.02% | 0.3% | pass |
+| rise_and_tilt | COLMAP | 0.019° | 0.01% | 0.0% | pass |
+| truck_right | COLMAP | 0.006° | 0.00% | 0.1% | pass |
+| pan | keyframe rotation | 0.007° | — | — | pass |
+| roll | keyframe rotation | 0.008° | — | — | pass |
+| static | keyframe rotation | 0.001° | — | — | pass |
+| tilt | keyframe rotation | 0.004° | — | — | pass |
+| zoom_only | keyframe rotation | 0.013° | — | — | pass (zoom ratio −0.3%) |
+| **dolly_zoom** | Perceptual fallback | 0.154° | 29.4% | 100% | **FAIL** |
+| hard cut (orbit→pan) | per shot | 0.449° / 0.007° | 0.42% / — | — | pass, cut at frame 60 |
+
+Timing is exact on every scene (output duration equals source; proxy frame count and
+fps verified with ffprobe). Accelerating and decelerating keep their speed profiles
+(correlation 1.000).
+
+Real footage (two locked-off public sample clips with people walking through, where the
+truth is zero motion): phantom rotation 0.14° and 0.36° over 15 s, no phantom zoom, no
+false cuts.
+
+## 14. Known limitations
+
+- **Dolly zoom** fails: a zooming lens leaves COLMAP's pairs uncalibrated and it cannot
+  initialise. The fallback holds translation at zero and reports LOW confidence rather
+  than inventing a path. Needs zoom-aware self-calibration or learned geometry.
+- **Handheld positional shake** is only partly reproduced (27% speed error): it is finer
+  than the anchor spacing. Rotational shake is kept (correlation 0.96).
+- **Gravity** is estimated from camera orientations. A steadily pitched shot with no yaw
+  (crane_up) is ~8° off; a ground-plane cue from the reconstruction would fix it.
+- **Same-location cuts** with almost no histogram change and parallax on both sides
+  remain undetectable.
+- **FOV** falls back to a labelled 60° prior when the footage does not constrain focal
+  (forward and lateral moves); the UI says so and offers an override.
+- **Not built**: VGGT backend (Phase 5), third-person `trajectory_preview.mp4` (§18),
+  source-video diagnostic overlays (§21), side-by-side solver comparison (§23),
+  variable-frame-rate output resampling, telemetry ingestion (§26).
