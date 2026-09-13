@@ -45,6 +45,12 @@ class Services:
     def analysis_pipeline(self) -> AnalysisPipeline:
         return AnalysisPipeline(self.store, self.workspace, self.environment)
 
+    def solve_pipeline(self):
+        # Imported lazily: the solve stack pulls in pycolmap, which the analysis
+        # endpoints do not need.
+        from app.workers.solve import SolvePipeline
+        return SolvePipeline(self.store, self.workspace, self.environment)
+
 
 _services: Services | None = None
 

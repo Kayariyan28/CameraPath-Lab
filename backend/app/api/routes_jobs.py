@@ -1,9 +1,10 @@
-"""Job endpoints: create, upload, analyze, inspect, stream progress."""
+"""Job endpoints: create, upload, analyze, solve, render, inspect, stream progress."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -165,6 +166,103 @@ def analyze(
 
     services.executor.submit(work)
     return {"job_id": job_id, "started": True, "stream": f"/api/jobs/{job_id}/events"}
+
+
+# ---------------------------------------------------------------------- solve
+
+
+def _start(services: Services, job_id: str, fn) -> dict:
+    if not services.mark_running(job_id):
+        raise HTTPException(status_code=409, detail="this job is already running")
+
+    def work() -> None:
+        try:
+            fn()
+        finally:
+            services.mark_done(job_id)
+
+    services.executor.submit(work)
+    return {"job_id": job_id, "started": True, "stream": f"/api/jobs/{job_id}/events"}
+
+
+@router.post("/{job_id}/solve")
+def solve(
+    job_id: str,
+    settings: SolveSettings | None = None,
+    render: bool = True,
+    services: Services = Depends(get_services),
+) -> dict:
+    """Geometry, fusion, validation, exports — and the motion proxy unless render=false."""
+    job = _get_job(services, job_id)
+    if job.analysis is None:
+        raise HTTPException(status_code=409, detail="analyse the video first")
+    pipeline = services.solve_pipeline()
+    return _start(services, job_id, lambda: pipeline.run(job_id, settings, render=render))
+
+
+@router.post("/{job_id}/render")
+def render(
+    job_id: str,
+    settings: SolveSettings | None = None,
+    services: Services = Depends(get_services),
+) -> dict:
+    """Re-render only. Reads the exported trajectories, so a new proxy style or
+    output size never recomputes geometry (spec §31). Only output-side settings
+    are taken from the request."""
+    job = _get_job(services, job_id)
+    if not job.trajectories:
+        raise HTTPException(status_code=409, detail="solve the video first")
+    if settings is not None:
+        output_fields = ("proxy_style", "output_width", "output_height",
+                         "match_source_aspect", "output_fps", "render_trajectory_preview")
+
+        def apply(j: Job) -> None:
+            for name in output_fields:
+                setattr(j.settings, name, getattr(settings, name))
+        services.store.update(job_id, apply)
+    pipeline = services.solve_pipeline()
+    return _start(services, job_id, lambda: pipeline.render(job_id))
+
+
+@router.get("/{job_id}/trajectory")
+def get_trajectory(job_id: str, services: Services = Depends(get_services)) -> dict:
+    job = _get_job(services, job_id)
+    if not job.trajectories:
+        raise HTTPException(status_code=404, detail="no trajectory yet")
+    return {
+        "job_id": job_id,
+        "shots": [t.model_dump(mode="json") for t in job.trajectories],
+    }
+
+
+#: Output filenames the API will serve: plain names only, no separators.
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}$")
+
+
+@router.get("/{job_id}/outputs")
+def list_outputs(job_id: str, services: Services = Depends(get_services)) -> dict:
+    job = _get_job(services, job_id)
+    outputs_dir = services.workspace.job(job_id).outputs_dir
+    files = []
+    if outputs_dir.is_dir():
+        for p in sorted(outputs_dir.iterdir()):
+            if p.is_file() and not p.name.startswith(".") and _SAFE_NAME.match(p.name):
+                files.append({"name": p.name, "size_bytes": p.stat().st_size,
+                              "url": f"/api/jobs/{job_id}/outputs/{p.name}"})
+    return {"job_id": job_id, "outputs": job.outputs.model_dump(), "files": files}
+
+
+@router.get("/{job_id}/outputs/{filename}")
+def get_output(job_id: str, filename: str, services: Services = Depends(get_services)):
+    _get_job(services, job_id)
+    if not _SAFE_NAME.match(filename):
+        raise HTTPException(status_code=400, detail="invalid file name")
+    outputs_dir = services.workspace.job(job_id).outputs_dir.resolve()
+    path = (outputs_dir / filename).resolve()
+    # Containment check in addition to the name whitelist.
+    if path.parent != outputs_dir or not path.is_file():
+        raise HTTPException(status_code=404, detail="no such output")
+    return FileResponse(path, filename=filename)
 
 
 @router.post("/{job_id}/cancel")
