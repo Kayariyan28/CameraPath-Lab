@@ -191,3 +191,143 @@ class TestWindowMerge:
             align_overlapping_windows(pos, q, pos, q, slice(0, 1), slice(0, 1))
         with pytest.raises(ValueError):
             align_overlapping_windows(pos, q, pos, q, slice(0, 5), slice(0, 3))
+
+
+class TestDegenerateTrajectoryAlignment:
+    """A straight dolly/truck/pedestal has collinear camera centres, so positions
+    cannot fix the roll about the path axis. Found when a COLMAP solve accurate
+    to 0.011 deg was scored at 179.7 deg rotation error.
+
+    The noise model matters and is deliberately realistic: estimate and reference
+    carry INDEPENDENT perpendicular noise. With an exact transform of the same
+    noisy points, the noise is perfectly correlated, pins the roll, and
+    position-only Umeyama passes — that version of this test was vacuous.
+    """
+
+    @staticmethod
+    def _case(seed: int):
+        from app.geometry.alignment import Similarity
+        from app.geometry.rotations import quat_from_axis_angle, quat_multiply, quat_to_matrix
+
+        rng = np.random.default_rng(seed)
+        n = 13
+        line = np.stack([np.zeros(n), np.linspace(0, 22, n), np.full(n, 2.4)], axis=1)
+        ref_p = line + rng.normal(0, 1e-3, line.shape)
+        ref_q = [quat_from_axis_angle(np.array([0, 0, 1.0]), 0.01 * i) for i in range(n)]
+        gauge = Similarity(
+            0.37,
+            quat_to_matrix(quat_multiply(
+                quat_from_axis_angle(np.array([0, 1.0, 0]), rng.uniform(0, 2 * np.pi)),
+                quat_from_axis_angle(np.array([0, 0, 1.0]), 0.3),
+            )),
+            np.array([4.0, -2.0, 1.0]),
+        )
+        est_p = gauge.apply(line) + rng.normal(0, 1e-3 * 0.37, line.shape)
+        est_q = [gauge.apply_quaternion(q) for q in ref_q]
+        return est_p, est_q, ref_p, ref_q
+
+    @staticmethod
+    def _rot_mae(transform, est_q, ref_q):
+        from app.geometry.rotations import quat_angular_distance
+        return float(np.mean([
+            np.degrees(quat_angular_distance(transform.apply_quaternion(e), r))
+            for e, r in zip(est_q, ref_q)
+        ]))
+
+    def test_position_only_umeyama_is_unreliable_here(self):
+        """Documents the failure the fix exists for, so the test above it is
+        known to discriminate."""
+        from app.geometry.alignment import umeyama
+        failures = 0
+        for seed in range(12):
+            est_p, est_q, ref_p, ref_q = self._case(seed)
+            if self._rot_mae(umeyama(est_p, ref_p), est_q, ref_q) > 1.0:
+                failures += 1
+        assert failures >= 6
+
+    def test_collinear_path_aligns_via_orientations(self):
+        from app.geometry.alignment import align_poses
+        for seed in range(12):
+            est_p, est_q, ref_p, ref_q = self._case(seed)
+            transform, method = align_poses(est_p, est_q, ref_p, ref_q)
+            assert method == "path_axis+orientations"
+            assert self._rot_mae(transform, est_q, ref_q) < 0.01, f"seed {seed}"
+            assert transform.scale == pytest.approx(1 / 0.37, rel=1e-3)
+
+    def test_align_and_measure_reports_a_perfect_collinear_solve_as_perfect(self):
+        from app.geometry.alignment import align_and_measure
+        est_p, est_q, ref_p, ref_q = self._case(5)
+        _, err = align_and_measure(est_p, est_q, ref_p, ref_q, allow_scale=True)
+        assert err.rotation_mae_degrees < 0.01
+        assert err.normalized_shape_error < 1e-3
+        assert err.alignment_method == "path_axis+orientations"
+
+    def test_collinear_path_still_measures_a_real_yaw_error(self):
+        """Positions fix the path direction, so cameras yawed off the path are a
+        real error the alignment must not absorb."""
+        from app.geometry.alignment import align_and_measure
+        from app.geometry.rotations import quat_from_axis_angle, quat_identity
+        pos = np.array([[0.0, float(i), 0.0] for i in range(10)])
+        pos_est = pos + np.random.default_rng(0).normal(0, 1e-4, pos.shape)
+        est_q = [quat_from_axis_angle(np.array([0.0, 0.0, 1.0]), np.radians(3.0))] * 10
+        _, err = align_and_measure(pos_est, est_q, pos, [quat_identity()] * 10)
+        assert err.rotation_mae_degrees == pytest.approx(3.0, abs=0.05)
+
+    def test_static_camera_aligns_purely_on_orientation(self):
+        """A pure pan: no position spread at all."""
+        from app.geometry.alignment import align_poses
+        from app.geometry.rotations import quat_from_axis_angle
+        ref_q = [quat_from_axis_angle(np.array([0, 0, 1.0]), a) for a in np.linspace(0, 1, 8)]
+        offset = quat_from_axis_angle(np.array([1.0, 1.0, 0]) / np.sqrt(2), 0.9)
+        from app.geometry.rotations import quat_multiply
+        est_q = [quat_multiply(offset, q) for q in ref_q]
+        pos = np.zeros((8, 3))
+        transform, method = align_poses(pos, est_q, pos, ref_q)
+        assert method == "orientations"
+        assert self._rot_mae(transform, est_q, ref_q) < 1e-6
+
+    def test_well_spread_positions_still_use_positions(self):
+        """An orbit spreads in two directions; positions stay authoritative."""
+        from app.geometry.alignment import Similarity, align_poses
+        from app.geometry.rotations import quat_from_axis_angle, quat_to_matrix
+        t = np.linspace(0, np.pi, 20)
+        ref_p = np.stack([10 * np.cos(t), 10 * np.sin(t), np.full_like(t, 3.0)], axis=1)
+        ref_q = [quat_from_axis_angle(np.array([0, 0, 1.0]), a) for a in t]
+        gauge = Similarity(2.0, quat_to_matrix(quat_from_axis_angle(np.array([1.0, 0, 0]), 0.7)),
+                           np.array([1.0, 2.0, 3.0]))
+        est_p = gauge.apply(ref_p)
+        est_q = [gauge.apply_quaternion(q) for q in ref_q]
+        transform, method = align_poses(est_p, est_q, ref_p, ref_q)
+        assert method == "positions"
+        assert self._rot_mae(transform, est_q, ref_q) < 1e-6
+
+    def test_window_stitch_on_a_straight_segment_keeps_orientation(self):
+        from app.geometry.alignment import align_overlapping_windows
+        from app.geometry.rotations import quat_angular_distance
+        est_p, est_q, ref_p, ref_q = self._case(9)
+        _, _, quats = align_overlapping_windows(
+            ref_p, ref_q, est_p, est_q, slice(0, 8), slice(0, 8)
+        )
+        worst = max(np.degrees(quat_angular_distance(q, r)) for q, r in zip(quats, ref_q))
+        assert worst < 0.05
+
+
+def test_static_reference_ignores_estimate_position_noise():
+    """A pan: the reference cameras never move, but a solver's estimate carries
+    isotropic position noise. A noise cloud passes any rank-ratio test while
+    carrying no direction, so it must not decide the rotation."""
+    from app.geometry.alignment import align_poses
+    from app.geometry.rotations import (
+        quat_angular_distance, quat_from_axis_angle, quat_multiply,
+    )
+    rng = np.random.default_rng(1)
+    ref_q = [quat_from_axis_angle(np.array([0, 0, 1.0]), a) for a in np.linspace(0, 1.2, 21)]
+    offset = quat_from_axis_angle(np.array([0.3, 1.0, 0.2]) / np.linalg.norm([0.3, 1.0, 0.2]), 1.9)
+    est_q = [quat_multiply(offset, q) for q in ref_q]
+    ref_p = np.zeros((21, 3))
+    est_p = rng.normal(0, 0.05, (21, 3))
+    transform, method = align_poses(est_p, est_q, ref_p, ref_q)
+    assert method == "orientations"
+    worst = max(np.degrees(quat_angular_distance(transform.apply_quaternion(e), r))
+                for e, r in zip(est_q, ref_q))
+    assert worst < 1e-6
