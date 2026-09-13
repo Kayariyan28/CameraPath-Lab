@@ -27,6 +27,11 @@ from app.tracking.dynamic_rejection import GeometricDynamicRejector
 from app.tracking.features import blur_score, normalize_contrast, texture_score
 from app.tracking.flow import LucasKanadeTracker
 from app.tracking.global_motion import estimate_transition, summarise
+from app.tracking.parallax import (
+    ParallaxEvidence,
+    TrackSnapshotRecorder,
+    summarize as summarize_parallax,
+)
 from app.video.decoder import FrameDecoder, fit_long_edge
 
 log = get_logger("tracking.shot_motion")
@@ -44,6 +49,10 @@ class ShotMotionResult:
     """(width, height) the motion was measured at. Needed to convert pixel
     quantities to angles later, so it must travel with the data."""
 
+    parallax: ParallaxEvidence = field(default_factory=ParallaxEvidence)
+    """Wide-baseline parallax evidence. This decides whether translation is
+    observable, and therefore which solver the shot is routed to."""
+
     persistent_track_count: int = 0
     mean_track_age: float = 0.0
     total_tracks_spawned: int = 0
@@ -51,6 +60,64 @@ class ShotMotionResult:
     texture: float = 0.0
     blur: float = 1.0
     warnings: list[str] = field(default_factory=list)
+
+
+#: Feature budget for the parallax pre-pass. Deliberately far below the main
+#: pass: parallax needs long-lived tracks spread across the frame, not density,
+#: and this pass exists only to answer one yes/no question.
+PREPASS_FEATURES = 700
+
+
+def measure_parallax(
+    info: VideoInfo,
+    shot: Shot,
+    frames_meta: list[FrameMetadata],
+    *,
+    long_edge: int = 1080,
+) -> ParallaxEvidence:
+    """Light pre-pass that establishes whether translation is observable.
+
+    Why this runs before the main analysis rather than falling out of it: the
+    parallax verdict decides two things the main pass needs up front — which
+    static-scene model the dynamic-object rejector should judge against, and
+    which solver the shot is routed to. Both are decided by whether the camera
+    translated through depth, and that cannot be known until tracks have been
+    followed across a real baseline.
+
+    The alternative — measure parallax during the main pass and accept that the
+    rejector spent that pass using the wrong model — produced a 48% false
+    "moving content" reading on a synthetic dolly containing no moving object.
+    A pre-pass at roughly a third of the feature budget is the cheaper mistake.
+    """
+    width, height = fit_long_edge(info.width, info.height, long_edge)
+    decoder = FrameDecoder(info, long_edge=long_edge, gray=True)
+    tracker = LucasKanadeTracker(max_features=PREPASS_FEATURES)
+    snapshots = TrackSnapshotRecorder()
+
+    by_index = {fm.frame_index: fm for fm in frames_meta}
+    start = by_index.get(shot.start_frame)
+    start_seconds = start.time_seconds if start else shot.start_time
+
+    for frame_index, frame in decoder.iter_frames(
+        start_frame=shot.start_frame,
+        end_frame=shot.end_frame,
+        start_time=start_seconds,
+    ):
+        flow_result = tracker.track(frame_index, normalize_contrast(frame))
+        if flow_result is None or flow_result.count == 0:
+            continue
+        flow = flow_result.flow_vectors()
+        magnitude = float(np.median(np.linalg.norm(flow, axis=1))) if len(flow) else 0.0
+        snapshots.observe(
+            frame_index, flow_result.track_ids, flow_result.curr_points, magnitude
+        )
+
+    evidence = summarize_parallax(snapshots.pairs())
+    log.info(
+        "shot %d parallax pre-pass: score=%.3f reliable=%s over %d baselines",
+        shot.id, evidence.score, evidence.measurement_reliable, evidence.pair_count,
+    )
+    return evidence
 
 
 def analyze_shot_motion(
@@ -62,10 +129,25 @@ def analyze_shot_motion(
     max_features: int = 2000,
     dynamic_strength: float = 0.5,
     reporter: StageReporter | None = None,
+    parallax: ParallaxEvidence | None = None,
 ) -> ShotMotionResult:
     """Analyse one shot. `frames_meta` is the whole video's frame list; only the
-    shot's own range is read from it, so timestamps stay the measured ones."""
+    shot's own range is read from it, so timestamps stay the measured ones.
+
+    `parallax` may be supplied to skip the pre-pass when it has already been
+    measured (the pipeline does this); otherwise it is measured here.
+    """
     width, height = fit_long_edge(info.width, info.height, long_edge)
+
+    # Parallax must be judged over a BASELINE, not between adjacent frames: a
+    # slow dolly moves almost nothing per frame, so consecutive views really are
+    # related by a homography to within noise. Measured on a synthetic clip with
+    # 22 m of genuine translation, adjacent-frame analysis scored 0.008.
+    if parallax is None:
+        if reporter:
+            reporter.progress(0.0, f"shot {shot.id}: measuring parallax")
+        parallax = measure_parallax(info, shot, frames_meta, long_edge=long_edge)
+
     decoder = FrameDecoder(info, long_edge=long_edge, gray=True)
     tracker = LucasKanadeTracker(max_features=max_features)
     rejector = GeometricDynamicRejector()
@@ -116,7 +198,9 @@ def analyze_shot_motion(
         prev_time = timestamp
 
         weights = rejector.update(
-            flow_result, tracker.tracks, (width, height), strength=dynamic_strength
+            flow_result, tracker.tracks, (width, height),
+            strength=dynamic_strength,
+            parallax_present=parallax.translation_observable,
         )
         mf = estimate_transition(
             flow_result, timestamp, dt, (width, height), weights=weights
@@ -132,6 +216,12 @@ def analyze_shot_motion(
     signature = summarise(
         motion_frames, duration=shot.duration, texture=texture, blur=blur
     )
+
+    # The per-transition parallax estimate cannot see depth structure; the
+    # wide-baseline measurement is authoritative.
+    signature.parallax_score = parallax.score
+    if parallax.pair_count:
+        signature.homography_dominance = parallax.homography_inlier_ratio
 
     # ---- honest warnings, surfaced in the analysis panel ----
     if texture < 0.25:
@@ -159,11 +249,8 @@ def analyze_shot_motion(
             f"Moving content detected across ~{dyn:.0%} of the frame. "
             "Camera estimation is using background features only."
         )
-    if signature.parallax_score < 0.12 and signature.mean_flow_magnitude >= 0.5:
-        warnings.append(
-            "Very little parallax — a single homography explains the motion. "
-            "Physical translation is not reliably observable in this shot."
-        )
+    if not parallax.translation_observable and signature.mean_flow_magnitude >= 0.5:
+        warnings.append(f"Translation is not reliably observable: {parallax.reason}")
 
     result = ShotMotionResult(
         shot_id=shot.id,
@@ -174,6 +261,7 @@ def analyze_shot_motion(
         mean_track_age=tracker.mean_track_age(),
         total_tracks_spawned=tracker.total_spawned(),
         dynamic_region_fraction=dyn,
+        parallax=parallax,
         texture=texture,
         blur=blur,
         warnings=warnings,
@@ -181,9 +269,9 @@ def analyze_shot_motion(
 
     log.info(
         "shot %d motion: %d transitions, mean flow %.2f px, inliers %.0f%%, "
-        "parallax %.2f, jitter %.2f, %d persistent tracks",
+        "parallax %.2f over %d baselines, jitter %.2f, %d persistent tracks",
         shot.id, len(motion_frames), signature.mean_flow_magnitude,
         signature.mean_inlier_ratio * 100, signature.parallax_score,
-        signature.jitter_score, result.persistent_track_count,
+        parallax.pair_count, signature.jitter_score, result.persistent_track_count,
     )
     return result

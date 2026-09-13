@@ -88,6 +88,7 @@ class DynamicRejectionBackend(Protocol):
         image_size: tuple[int, int],
         *,
         strength: float = 0.5,
+        parallax_present: bool = False,
     ) -> np.ndarray:
         """Return per-correspondence background confidence in [0,1], aligned
         with `flow_result.track_ids`."""
@@ -101,9 +102,16 @@ class GeometricDynamicRejector:
 
     def __init__(self) -> None:
         self._dynamic_cells_history: list[np.ndarray] = []
+        self._model_used: str = "similarity"
 
     def reset(self) -> None:
         self._dynamic_cells_history.clear()
+        self._model_used = "similarity"
+
+    @property
+    def model_used(self) -> str:
+        """Which static-scene model(s) the last verdict was judged against."""
+        return self._model_used
 
     # ------------------------------------------------------------------ cues
 
@@ -128,6 +136,100 @@ class GeometricDynamicRejector:
     def _residuals(model: np.ndarray, src: np.ndarray, dst: np.ndarray) -> np.ndarray:
         pred = (np.asarray(model)[:2, :2] @ src.T).T + np.asarray(model)[:2, 2]
         return np.linalg.norm(pred - dst, axis=1)
+
+    @staticmethod
+    def _rigid_scene_residuals(
+        src: np.ndarray, dst: np.ndarray, similarity_residuals: np.ndarray,
+        *, use_epipolar: bool,
+    ) -> tuple[np.ndarray, str]:
+        """Residual against the best available STATIC-SCENE model.
+
+        The similarity residual alone is not a moving-object detector once the
+        camera translates through a scene with depth. Near objects then move
+        faster than any single 2D transform predicts, so parallax itself shows up
+        as a large, spatially coherent residual — measured at 48% of the frame
+        on a synthetic dolly whose scene contains no moving object at all.
+
+        The fix is to ask the right question: is this point consistent with SOME
+        rigid interpretation of the scene?
+
+          * a homography explains a static scene under pure rotation, pure zoom,
+            or a planar/distant scene
+          * the epipolar constraint explains a static scene under ANY camera
+            motion, at any depth distribution
+
+        A static world point satisfies at least one of these. An independently
+        moving object satisfies neither. So the per-point residual is the MINIMUM
+        of the two, and each model covers the case where the other degenerates —
+        F is ill-conditioned under pure rotation, H cannot represent parallax.
+
+        The epipolar model is admitted ONLY when parallax has actually been
+        measured (`use_epipolar`), and that gate is not a nicety. The epipolar
+        constraint is a *weaker* test than a 2D transform: it has 7 degrees of
+        freedom and constrains each point to a line rather than a point. Where
+        the scene is planar or the camera only rotated, it buys nothing and costs
+        real detection power — with two distinct translation directions in the
+        frame (a background pan plus a subject crossing it) an F can place
+        epipolar lines through BOTH, and the subject becomes invisible. Measured:
+        admitting F unconditionally let a synthetic moving subject through at
+        weight 0.67 instead of being rejected below 0.4.
+
+        So: no parallax means the stricter 2D test is both correct and safer.
+        Parallax means the 2D test is wrong and must be relaxed.
+
+        Known limitation, inherent to any geometry-only method: even with the
+        gate, an object moving ALONG its epipolar line satisfies the epipolar
+        constraint and is invisible here. Separating that case needs semantic
+        segmentation, which is why this class sits behind
+        DynamicRejectionBackend.
+        """
+        best = similarity_residuals
+        used = "similarity"
+
+        if len(src) < 20:
+            return best, used
+
+        motion = float(np.median(np.linalg.norm(dst - src, axis=1)))
+
+        # Homography: right model for rotation-only, zoom, and planar scenes.
+        h, _ = cv2.findHomography(
+            src, dst, method=cv2.USAC_MAGSAC,
+            ransacReprojThreshold=RANSAC_THRESHOLD_FIT, maxIters=3000, confidence=0.995,
+        )
+        if h is not None and np.isfinite(h).all():
+            homo = np.hstack([src, np.ones((len(src), 1))])
+            proj = homo @ np.asarray(h).T
+            w = proj[:, 2:3]
+            w = np.where(np.abs(w) < 1e-12, 1e-12, w)
+            h_res = np.linalg.norm(proj[:, :2] / w - dst, axis=1)
+            if np.isfinite(h_res).all():
+                best = np.minimum(best, h_res)
+                used = "similarity+homography"
+
+        # Epipolar: right model whenever the camera translates through depth.
+        # Needs measured parallax (see the docstring) and enough motion to be
+        # numerically conditioned at all.
+        if use_epipolar and len(src) >= 50 and motion > 1.5:
+            f, _ = cv2.findFundamentalMat(
+                src, dst, method=cv2.USAC_MAGSAC,
+                ransacReprojThreshold=1.5, confidence=0.995, maxIters=4000,
+            )
+            if f is not None and f.shape == (3, 3) and np.isfinite(f).all():
+                # Sampson distance: first-order geometric distance to the
+                # epipolar variety, in pixels.
+                x1 = np.hstack([src, np.ones((len(src), 1))])
+                x2 = np.hstack([dst, np.ones((len(dst), 1))])
+                fx1 = x1 @ np.asarray(f).T
+                ftx2 = x2 @ np.asarray(f)
+                num = np.sum(x2 * fx1, axis=1) ** 2
+                den = fx1[:, 0] ** 2 + fx1[:, 1] ** 2 + ftx2[:, 0] ** 2 + ftx2[:, 1] ** 2
+                den = np.where(den < 1e-12, 1e-12, den)
+                sampson = np.sqrt(num / den)
+                if np.isfinite(sampson).all():
+                    best = np.minimum(best, sampson)
+                    used = used + "+epipolar"
+
+        return best, used
 
     @staticmethod
     def _is_stuck_track_cluster(
@@ -233,7 +335,11 @@ class GeometricDynamicRejector:
         image_size: tuple[int, int],
         *,
         strength: float = 0.5,
+        parallax_present: bool = False,
     ) -> np.ndarray:
+        """`parallax_present` must come from a real measurement (see
+        tracking/parallax.py), not a guess — it selects which static-scene model
+        this frame is judged against."""
         n = flow_result.count
         if n == 0:
             return np.empty((0,), np.float32)
@@ -243,9 +349,15 @@ class GeometricDynamicRejector:
         if model is None:
             return np.full(n, 0.5, np.float32)
 
-        residuals = self._residuals(model, src, dst)
+        similarity_residuals = self._residuals(model, src, dst)
         pred = (np.asarray(model)[:2, :2] @ src.T).T + np.asarray(model)[:2, 2]
         residual_vectors = dst - pred
+
+        # Judge against the best rigid-scene interpretation, not against a single
+        # 2D transform — otherwise parallax reads as moving content.
+        residuals, self._model_used = self._rigid_scene_residuals(
+            src, dst, similarity_residuals, use_epipolar=parallax_present
+        )
 
         # Scale the tolerance to this transition's own motion, not a constant.
         median_flow = float(np.median(np.linalg.norm(dst - src, axis=1))) if len(src) else 0.0
