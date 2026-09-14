@@ -34,3 +34,6 @@ benchmarks/clips/
 
 # Real-footage test clips (third-party samples, not committed)
 benchmarks/real/
+
+# TypeScript incremental build info
+*.tsbuildinfo
