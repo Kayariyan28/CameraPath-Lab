@@ -124,18 +124,38 @@ def _env(tmp_path: Path, extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def _launch_argv() -> list[str]:
+    """How to start the server as a client would.
+
+    The wrapper is the documented launch path, so prefer it — but it insists on
+    `.venv/bin/python` and exits before printing a byte without one. CI installs
+    the dependencies into the job's own interpreter instead of a virtualenv, so
+    there the module is started directly: what these tests assert is a property
+    of the server's stdout, not of the shell script.
+    """
+    venv_python = REPO_ROOT / ".venv" / "bin" / "python"
+    if venv_python.is_file() and WRAPPER.is_file() and os.access(WRAPPER, os.X_OK):
+        return [str(WRAPPER)]
+    return [sys.executable, "-m", "app.agent.mcp_server"]
+
+
 @pytest.fixture()
 def wrapper_server(tmp_path: Path):
-    if not WRAPPER.is_file() or not os.access(WRAPPER, os.X_OK):
-        pytest.skip("scripts/cpl-mcp is missing or not executable")
-    server = _Server([str(WRAPPER)], _env(tmp_path), REPO_ROOT)
+    env = _env(tmp_path)
+    argv = _launch_argv()
+    if argv[0] != str(WRAPPER):
+        # The wrapper exports this for the module path to resolve; without it a
+        # direct `-m` launch cannot import the app package.
+        backend = str(REPO_ROOT / "backend")
+        env["PYTHONPATH"] = f"{backend}{os.pathsep}{env['PYTHONPATH']}" if env.get("PYTHONPATH") else backend
+    server = _Server(argv, env, REPO_ROOT)
     try:
         yield server
     finally:
         server.close()
 
 
-def test_the_wrapper_speaks_clean_json_rpc_over_stdio(wrapper_server: _Server):
+def test_the_server_speaks_clean_json_rpc_over_stdio(wrapper_server: _Server):
     init = wrapper_server.handshake()
     assert init["result"]["serverInfo"]["name"] == "camerapath-lab"
     assert "normalized units, not metres" in init["result"]["instructions"]
