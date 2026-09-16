@@ -23,6 +23,36 @@ proxy.
 
 ---
 
+## Demo
+
+A real session, recorded end to end: drop in a 14-second clip, analyse it, and generate
+the motion reference. The long solve is time-lapsed and labelled; everything else runs
+at normal speed.
+
+![CameraPath Lab, from upload to rendered motion reference](docs/images/demo.gif)
+
+*[Full-resolution recording (MP4, 43 s)](docs/media/camerapath-demo.mp4)*
+
+The clip is three Blender shots joined by hard cuts — an FPV curve, an orbit and a
+crane up. The app found both cuts at the exact frame and solved each shot on its own.
+
+**Recovered camera trajectory** — shot 2, the orbit. Keyframe frustums along the path,
+the live pose readout, per-frame kinematics, and the rendered proxy beside it:
+
+![Recovered 3D camera trajectory for the orbit shot](docs/images/app-trajectory.png)
+
+**Analysis, before any 3D solve** — shots and cuts, measured image motion, and the
+per-shot routing decision:
+
+![Shot detection and measured image motion](docs/images/app-analysis.png)
+
+**Reference against proxy**, at the same timestamps:
+
+![The reference video and the motion proxy at matching timestamps](docs/images/reference-vs-proxy.png)
+
+The proxy reproduces the motion and the timing. It reproduces none of the content —
+that is the point, since it is a motion reference, not a copy of the source.
+
 ## Features
 
 - **Shot and cut detection.** Cuts are found with several cues: motion-compensated
