@@ -32,6 +32,26 @@ def configure_root_logging(level: int = logging.INFO) -> None:
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 
+def configure_agent_logging(stream=None, level: int = logging.INFO) -> None:
+    """Route every log record to `stream` (stderr by default).
+
+    `configure_root_logging` installs a handler on **stdout**, which is correct
+    for the web app and fatal for the MCP stdio transport: the first log line
+    would be interleaved with the JSON-RPC stream and the client would see a
+    parse error. This is its sibling rather than a parameter on it, so the web
+    app's behaviour is untouched.
+
+    The root handler list is replaced outright — not appended to — so a module
+    imported later that calls `configure_root_logging` cannot put stdout back.
+    """
+    handler = logging.StreamHandler(stream if stream is not None else sys.stderr)
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt="%H:%M:%S"))
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(level)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"cpl.{name}")
 

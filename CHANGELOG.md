@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Agent integration.** The pipeline is now usable as a tool, not just through the
+  UI, via one shared service layer (`backend/app/agent/`):
+  - an **MCP server** (`scripts/cpl-mcp`, stdio by default, optional streamable-HTTP)
+    with 13 tools covering the whole flow — environment check, start, poll, wait,
+    cancel, measured motion, prompt-ready description, outputs, trajectory samples,
+    re-render, list and delete — plus resources describing the coordinate
+    conventions, the environment and the job list
+  - a **JSON CLI** (`scripts/cpl`) that prints exactly one JSON document to stdout,
+    keeps progress on stderr, and maps error classes to distinct exit codes
+  - a `local` / `delegate` / `auto` execution model: jobs run in-process, or are
+    handed to a backend that is already running, and land in the same workspace
+    either way, so any agent-created job opens in the UI at `?job=<id>`
+  - [docs/agents.md](docs/agents.md) with client configuration, the tool reference
+    and how to read the results without over-claiming
+- Long-running work is split into start and bounded wait, because a solve outlasts
+  the tool-call timeout most MCP clients allow.
+
+### Fixed
+
+- The delegated runner assumed the backend on the port shares this checkout's
+  workspace. A second clone serving that port silently accepted uploads and wrote
+  them elsewhere, surfacing much later as an unrecognisable missing path. The
+  mismatch is now detected at the first write and reported with both paths.
+
 ## [0.1.0] - 2026-09-14
 
 First public release. The pipeline works end to end, from reference video to camera

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Launch the CameraPath Lab MCP server. Safe to invoke from any directory, and
+# from a path containing spaces: the interpreter is invoked directly rather than
+# through a venv console-script shebang (same reason as scripts/dev.sh).
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+PY="$ROOT/.venv/bin/python"
+[ -x "$PY" ] || { echo "No virtualenv at $PY — run ./scripts/bootstrap_macos.sh" >&2; exit 7; }
+export PYTHONPATH="$ROOT/backend${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONUNBUFFERED=1
+exec "$PY" -m app.agent.mcp_server "$@"

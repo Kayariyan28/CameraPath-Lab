@@ -18,3 +18,12 @@ opencv-contrib-python>=4.10,<5
 # --- classical 3D reconstruction (Phase 2) ---
 pycolmap>=3.11,<5
 pydantic-settings>=2.6
+
+# --- agent integration (MCP server + the HttpRunner's delegated mode) ---
+# Pinned to the 1.x line: mcp 2.x removed FastMCP (renamed MCPServer) and pulls
+# in httpx2/httpcore2/opentelemetry. 1.30.0 is the last 1.x and resolves against
+# our pydantic/starlette/uvicorn/anyio pins with zero changes to them.
+mcp==1.30.0
+# Runtime, not just tests: the delegated runner talks to the local backend over
+# HTTP. Previously only in requirements-dev.txt.
+httpx>=0.27,<1

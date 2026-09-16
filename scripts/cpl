@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# CameraPath Lab JSON CLI. Prints exactly one JSON document to stdout per
+# command; progress goes to stderr. Resolves its own directory so the repo path
+# — which may contain spaces — never has to be typed by the caller.
+set -euo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+PY="$ROOT/.venv/bin/python"
+[ -x "$PY" ] || { echo "No virtualenv at $PY — run ./scripts/bootstrap_macos.sh" >&2; exit 7; }
+export PYTHONPATH="$ROOT/backend${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONUNBUFFERED=1
+exec "$PY" -m app.agent.cli "$@"

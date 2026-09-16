@@ -84,6 +84,9 @@ that is the point, since it is a motion reference, not a copy of the source.
   - `analysis.json`
   - Nuke `.chan`
   - rendered motion-proxy MP4
+- **Usable by AI agents.** An MCP server and a JSON CLI expose the same pipeline as
+  tools, so an agent can hand over a video and get back the proxy MP4, the trajectory
+  and a prompt-ready description of the camera move. See [docs/agents.md](docs/agents.md).
 
 ## How it works
 
@@ -166,6 +169,21 @@ Other useful commands:
 .venv/bin/python scripts/doctor.py          # what works on this machine, and what doesn't
 ./scripts/bootstrap_macos.sh --check        # report only, change nothing
 ```
+
+## Use it from an agent
+
+The same pipeline is available as tools, so an AI agent can produce a motion
+reference without the UI:
+
+```bash
+./scripts/cpl run clip.mp4 --wait --describe    # JSON on stdout, progress on stderr
+./scripts/cpl-mcp                               # MCP server over stdio
+```
+
+Point any MCP client at the absolute path of `scripts/cpl-mcp`. The tools cover the
+whole flow — start a recovery, poll it, read the measured motion, get a prompt-ready
+description, and list the output files. Full reference, including the client config
+block and how to read the results honestly: [docs/agents.md](docs/agents.md).
 
 ## What it will and will not claim
 
