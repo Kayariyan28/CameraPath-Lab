@@ -308,3 +308,42 @@ def test_a_scale_calibration_switches_the_job_to_metric_mode():
 
 def test_no_calibration_leaves_the_job_normalized():
     assert build_solve_settings().scale_mode.value == "normalized"
+
+
+def test_rerender_passes_enums_not_strings_to_the_pipeline(
+    service: AgentService, fake_runner: FakeRunner, solved_job, monkeypatch
+):
+    """A style override must reach the render pipeline as a `ProxyStyle`.
+
+    `SolveSettings` does not validate on assignment, so merging overrides with
+    `setattr` left `proxy_style` a plain string and every styled re-render died
+    on `.value` inside the Blender stage — after the job had already been marked
+    as rendering.
+    """
+    from app.models.schemas.jobs import ProxyStyle
+
+    env = service.runner.environment()
+    if not env.blender_ok:
+        pytest.skip("Blender not installed; render_unavailable is raised first")
+
+    captured = {}
+    monkeypatch.setattr(
+        fake_runner, "render_only",
+        lambda job_id, settings: captured.update(settings=settings),
+    )
+    service.rerender(solved_job.id, output={"proxy_style": "ground_grid", "output_width": 1280})
+
+    settings = captured["settings"]
+    assert settings.proxy_style is ProxyStyle.GROUND_GRID
+    assert settings.proxy_style.value == "ground_grid"
+    assert settings.output_width == 1280
+
+
+def test_rerender_rejects_an_unknown_proxy_style(service: AgentService, solved_job):
+    env = service.runner.environment()
+    if not env.blender_ok:
+        pytest.skip("Blender not installed; render_unavailable is raised first")
+    with pytest.raises(AgentError) as exc:
+        service.rerender(solved_job.id, output={"proxy_style": "hexagons"})
+    assert exc.value.code == "invalid_input_path"
+    assert "proxy_style" in exc.value.message

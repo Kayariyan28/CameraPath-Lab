@@ -723,8 +723,11 @@ def main(argv: list[str] | None = None) -> int:
     # The fd swap happens before the runner is built, because building it
     # imports the pipeline stack and probes the toolchain with subprocesses.
     from app.agent import stdio_guard
+    from app.agent.solver_logs import quiet_solver_logs
 
-    stdio_guard.install(level=getattr(logging, args.log_level, logging.INFO))
+    level = getattr(logging, args.log_level, logging.INFO)
+    stdio_guard.install(level=level)
+    quiet_solver_logs(level)
 
     if args.workspace:
         os.environ["CPL_WORKSPACE_DIR"] = args.workspace

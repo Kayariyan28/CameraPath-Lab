@@ -46,9 +46,12 @@ per-shot routing decision:
 
 ![Shot detection and measured image motion](docs/images/app-analysis.png)
 
-**Reference against proxy**, at the same timestamps:
+**Reference against proxy, playing together.** Watch the horizon and the ground plane:
+the proxy carries the same roll, the same push and the same cut, frame for frame.
 
-![The reference video and the motion proxy at matching timestamps](docs/images/reference-vs-proxy.png)
+![The reference video and the rendered motion proxy playing side by side](docs/images/reference-vs-proxy.gif)
+
+*[Full 14 s side-by-side (MP4)](docs/media/reference-vs-proxy.mp4) · [the proxy on its own, as delivered (MP4)](docs/media/motion-proxy-example.mp4) · [the same moments as stills](docs/images/reference-vs-proxy.png)*
 
 The proxy reproduces the motion and the timing. It reproduces none of the content —
 that is the point, since it is a motion reference, not a copy of the source.
@@ -170,6 +173,62 @@ Other useful commands:
 ./scripts/bootstrap_macos.sh --check        # report only, change nothing
 ```
 
+## Using the output with Seedance 2.5
+
+This is what the project is for. A generative video model can be told *what* to show
+in words, but camera movement is hard to describe and harder to repeat. The proxy
+solves that by carrying the movement as a video: it holds the real camera path,
+rotation and timing of your reference clip, and nothing else.
+
+**1. Produce the proxy.** Either click **Generate motion reference** in the UI, or:
+
+```bash
+./scripts/cpl run your_clip.mp4 --wait --describe \
+  --proxy-style ground_grid --match-source-aspect
+```
+
+`--match-source-aspect` matters for vertical footage — without it a 9:16 clip is
+solved correctly but rendered into a 16:9 frame. The proxy always keeps the source's
+frame count, fps and duration, so it lines up on a timeline with the original.
+
+**2. Feed it as the reference clip.** Use the proxy wherever your tool accepts a video
+to condition on — a video-to-video, reference-video or camera-motion input. Input
+names differ between tools and releases, so check which one Seedance exposes for
+motion conditioning; what matters from this side is that the file is a normal MP4
+whose only content is the camera move.
+
+**3. Describe the subject in the prompt, not the camera.** The proxy already carries
+the camera. Spend the prompt on what the shot contains, and paste the app's own
+summary for the movement — it is generated from the measured numbers, so it agrees
+with the video you are supplying. For the demo clip above, the app produced:
+
+> Shot 1 (0.0–5.0 s): Camera flies forward, banking through the turns (forward flight
+> banking up to 13 deg), then tracks right (truck covering 28% of the path), then pans
+> left (22 deg pan left). Hard cut. Shot 2 (5.0–10.0 s): Camera orbits around the
+> subject (104 deg of yaw while travelling sideways about a centre). Hard cut.
+> Shot 3 (10.0–14.0 s): Camera rises while tilting down (vertical travel with 18 deg
+> of tilt).
+
+Get that text from **Results** in the UI, `./scripts/cpl describe <job_id>`, or the
+`describe_camera_motion` tool.
+
+**One shot per generation.** A clip with hard cuts is solved as separate shots, each in
+its own coordinate system, and the rendered proxy contains the cuts. Generative models
+generally behave better on a single continuous move, so for a multi-shot source take
+the per-shot proxies (`motion_proxy_shot_000.mp4`, …) and generate each shot separately.
+
+**Which proxy style.** `ground_grid` is the best default: of the four styles it was the
+only one whose motion a solver could read back out of the render with the path shape
+intact (8% shape error, against 18–30% for the others, measured on a fast FPV shot). It
+is also the least visually busy after `minimal`. `motion_cage` packs in the most
+geometry, which is useful for eyeballing a path but noisier as a conditioning signal.
+
+**What it will not do.** The proxy carries motion only — no style, subject, lighting or
+content transfer, by design. It cannot rescue a bad solve either: if the app reports LOW
+confidence, or says translation was not observable, the proxy faithfully reproduces a
+rotation-only move and the generated result will match that, not the source's real
+travel. Check the confidence before spending a generation on it.
+
 ## Use it from an agent
 
 The same pipeline is available as tools, so an AI agent can produce a motion
@@ -179,6 +238,13 @@ reference without the UI:
 ./scripts/cpl run clip.mp4 --wait --describe    # JSON on stdout, progress on stderr
 ./scripts/cpl-mcp                               # MCP server over stdio
 ```
+
+A real session — solve a clip, then ask for the description and the output paths:
+
+![The CameraPath Lab CLI solving a clip and returning JSON](docs/images/agent-cli-demo.gif)
+
+*[Full recording (MP4)](docs/media/agent-cli-demo.mp4). Progress goes to stderr, so a
+pipe gets nothing but the JSON document.*
 
 Point any MCP client at the absolute path of `scripts/cpl-mcp`. The tools cover the
 whole flow — start a recovery, poll it, read the measured motion, get a prompt-ready

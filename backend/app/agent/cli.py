@@ -289,11 +289,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    from app.agent.solver_logs import quiet_solver_logs
     from app.core.logging import configure_agent_logging
 
-    configure_agent_logging(
-        sys.stderr, level=getattr(logging, str(args.log_level).upper(), logging.WARNING)
-    )
+    level = getattr(logging, str(args.log_level).upper(), logging.WARNING)
+    configure_agent_logging(sys.stderr, level=level)
+    # Before the pipeline stack is imported: glog reads its threshold at init.
+    quiet_solver_logs(level)
 
     if args.workspace:
         os.environ["CPL_WORKSPACE_DIR"] = args.workspace

@@ -24,8 +24,29 @@ All notable changes to this project are documented here. The format follows
     and how to read the results without over-claiming
 - Long-running work is split into start and bounded wait, because a solve outlasts
   the tool-call timeout most MCP clients allow.
+- **Demo media and a Seedance guide** in the README: the reference and the rendered
+  proxy playing side by side, the proxy on its own as delivered, a recording of a real
+  CLI session, and a step-by-step section on conditioning a generative video model on
+  the proxy — which style to pick and why, how to handle multi-shot sources, and what
+  the proxy will not do.
+
+### Changed
+
+- COLMAP's per-image logging is turned down to warnings in the agent front ends (about
+  300 lines to six on one shot), because it was burying the CLI's own progress output.
+  `--log-level DEBUG` or an explicit `GLOG_minloglevel` keeps it. The web app is
+  untouched — there the same output goes to the server's terminal.
 
 ### Fixed
+
+- `render_motion_proxy` (and `cpl render`) failed for every proxy style: overrides were
+  merged onto `SolveSettings` with `setattr`, which does not validate, so the style
+  reached the Blender stage as a plain string and died on `.value`. The merge is
+  re-validated, which also rejects a bad style before Blender starts.
+- A re-render left the job's previous terminal state readable for the moment before the
+  worker started, so a client that polled at once took `complete` from the last run as
+  this render's answer — and read the old MP4. The job is now claimed before the call
+  returns.
 
 - The delegated runner assumed the backend on the port shares this checkout's
   workspace. A second clone serving that port silently accepted uploads and wrote

@@ -149,6 +149,10 @@ export CPL_AGENT_RUNNER=local
 `--pretty` (indented JSON) and `--quiet` (no stderr progress) are global flags, so
 they go **before** the subcommand: `./scripts/cpl --pretty motion <job_id>`.
 
+COLMAP's own per-image logging is turned down to warnings so it cannot bury the
+progress lines (about 300 lines to six on a typical shot). `--log-level DEBUG`, or
+setting `GLOG_minloglevel` yourself, keeps all of it.
+
 ### Exit codes
 
 | code | meaning |

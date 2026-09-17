@@ -177,17 +177,26 @@ class LocalRunner:
 
     def render_only(self, job_id: str, settings: SolveSettings | None) -> None:
         job_id = _checked_job_id(job_id)
-        if settings is not None:
-            output_fields = (
-                "proxy_style", "output_width", "output_height",
-                "match_source_aspect", "output_fps", "render_trajectory_preview",
-            )
+        output_fields = (
+            "proxy_style", "output_width", "output_height",
+            "match_source_aspect", "output_fps", "render_trajectory_preview",
+        )
 
-            def apply(job: Job) -> None:
+        def apply(job: Job) -> None:
+            if settings is not None:
                 for name in output_fields:
                     setattr(job.settings, name, getattr(settings, name))
+            # Claim the job before the worker starts. A re-render is almost always
+            # asked of a job that already finished, so until the background thread
+            # reaches the stage the record still reads `complete` (or the `failed`
+            # of an earlier attempt) — and a client that polls straight away takes
+            # that stale terminal state as this render's answer and reads the old
+            # MP4. Stamping it here closes that window; the pipeline owns every
+            # state after this one.
+            job.state = JobState.RENDERING
+            job.error = None
 
-            self.services.store.update(job_id, apply)
+        self.services.store.update(job_id, apply)
         self.start(job_id, Stages(analyze=False, solve=False, render=True),
                    self.services.store.get(job_id).settings)
 
@@ -469,6 +478,28 @@ class HttpRunner:
         job_id = _checked_job_id(job_id)
         body = settings.model_dump(mode="json") if settings is not None else None
         self._request("POST", f"/api/jobs/{job_id}/render", json=body)
+        self._await_claim(job_id)
+
+    def _await_claim(self, job_id: str, timeout: float = 5.0) -> None:
+        """Wait for the backend's worker to take the job off its previous state.
+
+        The endpoint returns as soon as the work is queued, so for the few
+        milliseconds before the worker starts, the record still reads whatever
+        the last run left — usually `complete`. A caller that polls immediately
+        would read that as this render's result. The local runner stamps the
+        state itself; here the backend owns it, so wait briefly for the stamp.
+        Returning after the timeout is fine: it degrades to the old behaviour
+        rather than failing a render that is merely slow to start.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if self.get(job_id).state is JobState.RENDERING:
+                    return
+            except AgentError:
+                return
+            time.sleep(0.1)
+        log.warning("job %s did not report rendering within %.0fs of the request", job_id, timeout)
 
     # -------------------------------------------------------------- reads
 

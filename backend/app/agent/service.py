@@ -20,6 +20,8 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from app.agent import outputs as outputs_mod
 from app.agent import report as report_mod
 from app.agent.describe import describe_job, describe_shot
@@ -523,7 +525,7 @@ class AgentService:
                 detail=blender.detail if blender else "",
                 hint="The trajectory exports are complete and usable without it.",
             )
-        merged = job.settings.model_copy(deep=True)
+        fields = job.settings.model_dump(mode="json")
         for name, value in (output or {}).items():
             if value is None:
                 continue
@@ -533,7 +535,22 @@ class AgentService:
                     f"{name} is not an output setting.",
                     detail=f"Re-render accepts only: {', '.join(OUTPUT_SETTING_FIELDS)}",
                 )
-            setattr(merged, name, value)
+            fields[name] = value
+        # Re-validate rather than assigning onto a copy: SolveSettings does not
+        # validate on assignment, so `settings.proxy_style = "ground_grid"` left a
+        # plain string where the render pipeline expects the enum, and every
+        # re-render with a style died on `.value`. Validating here also rejects a
+        # bad style or a negative size before Blender is started.
+        try:
+            merged = SolveSettings.model_validate(fields)
+        except ValidationError as exc:
+            first = exc.errors()[0]
+            field = ".".join(str(p) for p in first.get("loc", ())) or "settings"
+            raise AgentError(
+                "invalid_input_path",
+                f"invalid render setting: {field} — {first.get('msg', 'rejected')}",
+                detail=str(first.get("input", ""))[:200],
+            ) from exc
         self._record_stages(job_id, Stages(analyze=False, solve=False, render=True))
         self.runner.render_only(job_id, merged)
         status = self.status(job_id)

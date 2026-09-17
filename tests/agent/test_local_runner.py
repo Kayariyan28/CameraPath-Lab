@@ -74,3 +74,36 @@ def test_malformed_job_id_is_job_not_found(local_runner):
     with pytest.raises(AgentError) as exc:
         local_runner.get("not-a-uuid")
     assert exc.value.code == "job_not_found"
+
+
+def test_render_only_claims_the_job_before_returning(local_runner, monkeypatch):
+    """A re-render must not leave the previous terminal state readable.
+
+    Re-rendering is asked of a finished job, so a client that polls immediately
+    after the call would otherwise read the old `complete` as this render's
+    answer — and fetch the previous MP4.
+    """
+    from app.agent.models import Stages
+
+    job_id = local_runner.create()
+
+    def finished(job: Job) -> None:
+        job.state = JobState.COMPLETE
+        job.error = "an earlier attempt failed"
+
+    local_runner.services.store.update(job_id, finished)
+
+    started: list[str] = []
+    monkeypatch.setattr(
+        local_runner, "start",
+        lambda jid, stages, settings: started.append(jid),
+    )
+    local_runner.render_only(job_id, None)
+
+    job = local_runner.services.store.get(job_id)
+    assert job.state is JobState.RENDERING
+    assert job.error is None
+    assert started == [job_id]
+    # The stages recorded for the run must say render-only, or `terminal` would
+    # be computed against the wrong expectation.
+    assert Stages(analyze=False, solve=False, render=True).to_dict()["render"] is True
